@@ -1,7 +1,9 @@
+import base64
 import json
 import os
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -9,14 +11,20 @@ import boto3
 ec2 = boto3.client("ec2")
 ssm = boto3.client("ssm")
 sns = boto3.client("sns")
+s3 = boto3.client("s3")
+scheduler = boto3.client("scheduler")
 
 
 def handler(event, context):
+    # Delayed health-check invocation (from EventBridge Scheduler).
+    if isinstance(event, dict) and event.get("action") == "healthcheck":
+        return _handle_healthcheck(event)
+
     message = json.loads(event["Records"][0]["Sns"]["Message"])
     state = message.get("NewStateValue")
 
     if state == "ALARM":
-        return _handle_failover()
+        return _handle_failover(context)
     elif state == "OK":
         return _handle_teardown()
     else:
@@ -24,7 +32,7 @@ def handler(event, context):
         return
 
 
-def _handle_failover():
+def _handle_failover(context):
     if _find_failover_instance():
         print("Failover instance already running, skipping")
         return
@@ -49,12 +57,17 @@ def _handle_failover():
     instance_id = response["Instances"][0]["InstanceId"]
     print(f"Launched failover instance: {instance_id}")
 
+    # Schedule an independent check that the instance actually finished
+    # provisioning. If user-data dies silently (hang / signal / crash), the
+    # instance never writes its readiness marker and this catches it.
+    _schedule_healthcheck(instance_id, context.invoked_function_arn)
+
     alert_msg = (
         f"[Vaultwarden DR] Failover triggered.\n\n"
-        f"The on-prem server has been unreachable for 5+ minutes. "
+        f"The on-prem server has been unreachable for 3+ minutes. "
         f"A failover EC2 instance ({instance_id}) is launching with the latest S3 backup.\n\n"
         f"Once ready, it will be accessible at https://{os.environ['FAILOVER_DOMAIN']}.\n\n"
-        f"The instance will be automatically terminated when heartbeat recovers for 10+ minutes."
+        f"The instance will be automatically terminated when heartbeat recovers for 3+ minutes."
     )
 
     _notify_sns("Vaultwarden DR - Failover Triggered", alert_msg)
@@ -79,7 +92,7 @@ def _handle_teardown():
 
     alert_msg = (
         f"[Vaultwarden DR] Recovery detected.\n\n"
-        f"The on-prem server has been sending heartbeats for 10+ consecutive minutes. "
+        f"The on-prem server has been sending heartbeats for 3+ consecutive minutes. "
         f"Failover instance ({instance_id}) has been terminated automatically."
     )
 
@@ -90,6 +103,88 @@ def _handle_teardown():
     )
 
     return {"terminated_instance": instance_id}
+
+
+def _handle_healthcheck(event):
+    instance_id = event["instance_id"]
+    bucket = os.environ["S3_BACKUP_BUCKET"]
+    delay = os.environ.get("HEALTHCHECK_DELAY_MIN", "10")
+
+    if _ready_marker_exists(instance_id):
+        print(f"Health check OK: {instance_id} reported ready")
+        return {"status": "ready", "instance_id": instance_id}
+
+    state = _instance_state(instance_id)
+    if state not in ("pending", "running"):
+        # Instance was torn down (fast recovery) or never persisted -> not an
+        # outage of the failover itself. Stay quiet to avoid false alarms.
+        print(f"Instance {instance_id} inactive (state={state}); no alert")
+        return {"status": "inactive", "state": state, "instance_id": instance_id}
+
+    log_path = f"s3://{bucket}/failover-logs/{instance_id}.log"
+    print(f"Health check FAILED: {instance_id} is {state} but never reported ready")
+
+    discord_webhook = _get_ssm_param(os.environ["SSM_DISCORD_WEBHOOK"])
+    alert_msg = (
+        f"[Vaultwarden DR] Failover health check FAILED.\n\n"
+        f"Instance {instance_id} is '{state}' but did not finish provisioning "
+        f"within {delay} minutes. The failover site may be unavailable at "
+        f"https://{os.environ['FAILOVER_DOMAIN']}.\n\n"
+        f"Investigate the user-data log: {log_path}"
+    )
+    _notify_sns("Vaultwarden DR - Failover Health Check FAILED", alert_msg)
+    _notify_discord(
+        discord_webhook,
+        f"**[Vaultwarden DR]** ⚠️ Health check FAILED: instance `{instance_id}` "
+        f"({state}) did not finish provisioning within {delay} min. Log: `{log_path}`",
+    )
+    return {"status": "unhealthy", "state": state, "instance_id": instance_id}
+
+
+def _schedule_healthcheck(instance_id, function_arn):
+    delay = int(os.environ.get("HEALTHCHECK_DELAY_MIN", "10"))
+    run_at = (datetime.now(timezone.utc) + timedelta(minutes=delay)).strftime(
+        "at(%Y-%m-%dT%H:%M:%S)"
+    )
+    try:
+        scheduler.create_schedule(
+            Name=f"vw-dr-healthcheck-{instance_id}",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            ScheduleExpression=run_at,
+            ScheduleExpressionTimezone="UTC",
+            ActionAfterCompletion="DELETE",
+            Target={
+                "Arn": function_arn,
+                "RoleArn": os.environ["SCHEDULER_ROLE_ARN"],
+                "Input": json.dumps({"action": "healthcheck", "instance_id": instance_id}),
+            },
+        )
+        print(f"Scheduled health check for {instance_id} at {run_at} UTC")
+    except Exception as e:
+        # Never let a scheduling failure abort the actual failover launch.
+        print(f"Failed to schedule health check: {e}")
+
+
+def _ready_marker_exists(instance_id):
+    try:
+        s3.head_object(
+            Bucket=os.environ["S3_BACKUP_BUCKET"],
+            Key=f"failover-status/{instance_id}.ready",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _instance_state(instance_id):
+    try:
+        response = ec2.describe_instances(InstanceIds=[instance_id])
+    except Exception:
+        return None
+    for r in response["Reservations"]:
+        for i in r["Instances"]:
+            return i["State"]["Name"]
+    return None
 
 
 def _find_failover_instance():
@@ -150,7 +245,6 @@ def _build_user_data(tailscale_auth_key, discord_webhook, s3_bucket):
     script = script.replace("{{NOTIFICATION_EMAIL}}", os.environ["NOTIFICATION_EMAIL"])
     script = script.replace("{{CF_ZONE}}", os.environ["CF_ZONE"])
 
-    import base64
     return base64.b64encode(script.encode()).decode()
 
 
@@ -164,27 +258,55 @@ NOTIFICATION_EMAIL="{{NOTIFICATION_EMAIL}}"
 
 exec > /var/log/user-data.log 2>&1
 
+# Resolve our own instance id up front (IMDSv2) so logs/markers are keyed by it.
+IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+LOG_KEY="failover-logs/${INSTANCE_ID}.log"
+
+flush_log() {
+    aws s3 cp /var/log/user-data.log "s3://${S3_BACKUP_BUCKET}/${LOG_KEY}" >/dev/null 2>&1 || true
+}
+
 notify_discord() {
     curl -s -H "Content-Type: application/json" \
         -d "{\"content\": \"$1\"}" \
         "$DISCORD_WEBHOOK_URL" || true
 }
 
+# Continuously ship the log to S3 so it survives ANY death (error, hang that
+# trips the cloud-final service timeout, spot reclaim, SIGKILL). The on-error
+# handler used to be the only uploader, so a signal-kill lost the log entirely.
+( while true; do flush_log; sleep 15; done ) &
+LOG_SHIPPER_PID=$!
+
 on_error() {
-    notify_discord "**[Vaultwarden DR]** User-data script FAILED at line $1."
-    aws s3 cp /var/log/user-data.log "s3://${S3_BACKUP_BUCKET}/logs/user-data-$(date +%s).log" || true
+    notify_discord "**[Vaultwarden DR]** User-data FAILED at line $1 (instance \`$INSTANCE_ID\`). Log: \`s3://${S3_BACKUP_BUCKET}/${LOG_KEY}\`"
+    flush_log
 }
+
+on_signal() {
+    notify_discord "**[Vaultwarden DR]** User-data was KILLED by a signal before completing (instance \`$INSTANCE_ID\`). Log: \`s3://${S3_BACKUP_BUCKET}/${LOG_KEY}\`"
+    flush_log
+    exit 143
+}
+
 trap 'on_error $LINENO' ERR
+trap on_signal TERM INT
 
 set -euo pipefail
 
-dnf install -y docker nginx sqlite unzip tar gzip
+# Guard hang-prone steps with timeouts: a hang otherwise stalls until the
+# service is killed with no ERR trap. With `timeout`, a stall becomes a normal
+# non-zero exit that the ERR trap reports.
+timeout 300 dnf install -y docker nginx sqlite unzip tar gzip
 
 systemctl enable docker
 systemctl start docker
 
 curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=vaultwarden-failover
+timeout 120 tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=vaultwarden-failover
 
 LATEST_BACKUP=$(aws s3api list-objects-v2 \
     --bucket "$S3_BACKUP_BUCKET" \
@@ -206,8 +328,6 @@ mv /tmp/vaultwarden-restore/data /home/vaultwarden/data
 rm -rf /tmp/vaultwarden-restore
 
 TAILSCALE_IP=$(tailscale ip -4)
-IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-REGION=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 
 CF_TOKEN=$(aws ssm get-parameter --name "/vaultwarden-dr/cloudflare-api-token" --with-decryption --region "$REGION" --query 'Parameter.Value' --output text)
 
@@ -233,8 +353,8 @@ else
         --data "{\"type\":\"A\",\"name\":\"$FAILOVER_DOMAIN\",\"content\":\"$TAILSCALE_IP\",\"ttl\":60,\"proxied\":false}"
 fi
 
-dnf install -y python3-pip
-pip3 install certbot certbot-dns-cloudflare
+timeout 120 dnf install -y python3-pip
+timeout 300 pip3 install certbot certbot-dns-cloudflare
 
 mkdir -p /root/.secrets
 cat > /root/.secrets/cloudflare.ini <<CFEOF
@@ -242,7 +362,7 @@ dns_cloudflare_api_token = $CF_TOKEN
 CFEOF
 chmod 600 /root/.secrets/cloudflare.ini
 
-certbot certonly \
+timeout 180 certbot certonly \
     --dns-cloudflare \
     --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
     --dns-cloudflare-propagation-seconds 30 \
@@ -287,6 +407,13 @@ server {
 NGINXEOF
 
 systemctl restart nginx
+
+# Signal success to the health-check Lambda, then send the ready notification.
+echo "ready $(date -u +%FT%TZ) $INSTANCE_ID" | \
+    aws s3 cp - "s3://${S3_BACKUP_BUCKET}/failover-status/${INSTANCE_ID}.ready" || true
+
+kill "$LOG_SHIPPER_PID" 2>/dev/null || true
+flush_log
 
 notify_discord "Vaultwarden failover ready at \`https://$FAILOVER_DOMAIN\`. Backup restored: \`$LATEST_BACKUP\`. Tailscale IP: \`$TAILSCALE_IP\`"
 """

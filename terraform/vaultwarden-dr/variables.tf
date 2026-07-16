@@ -45,3 +45,15 @@ variable "ec2_instance_type" {
   type    = string
   default = "t3.micro"
 }
+
+variable "failover_ami_id" {
+  type        = string
+  default     = "ami-036bdae36143a955f"
+  description = "Pinned Amazon Linux 2023 AMI for the failover instance (validated end-to-end). Bump deliberately, not automatically."
+}
+
+variable "healthcheck_delay_min" {
+  type        = number
+  default     = 10
+  description = "Minutes after launch before verifying the failover instance finished provisioning"
+}

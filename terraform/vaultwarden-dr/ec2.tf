@@ -1,18 +1,3 @@
-data "aws_ami" "al2023" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-2023.*-x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
 resource "aws_security_group" "failover" {
   name        = "vaultwarden-dr-failover"
   description = "Security group for Vaultwarden failover instance"
@@ -27,7 +12,7 @@ resource "aws_security_group" "failover" {
 
 resource "aws_launch_template" "failover" {
   name                   = "vaultwarden-dr-failover"
-  image_id               = data.aws_ami.al2023.id
+  image_id               = var.failover_ami_id
   instance_type          = var.ec2_instance_type
   update_default_version = true
 
