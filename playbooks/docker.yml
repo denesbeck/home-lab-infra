@@ -63,7 +63,7 @@
     - name: Add user to Docker group
       user:
         name: "{{ ansible_user }}"
-        group: docker
+        groups: docker
         append: yes
 
     - name: Create Docker systemd override directory
@@ -85,9 +85,16 @@
           [Unit]
           Requires=network-online.target docker.socket
           After=network-online.target tailscaled.service
+          # StartLimitIntervalSec=0 disables systemd's start-rate limiter so
+          # Restart=always retries forever until the network is up. Without this,
+          # 3 fast ExecStartPre timeouts inside 60s tripped "start request repeated
+          # too quickly" and left the daemon permanently dead (2026-07-16 incident).
+          StartLimitIntervalSec=0
 
           [Service]
           ExecStartPre=/etc/systemd/system/docker.service.d/wait_for_network.sh
+          Restart=always
+          RestartSec=10
         mode: "0644"
       register: docker_override
 

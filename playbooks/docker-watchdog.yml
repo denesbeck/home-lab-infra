@@ -1,0 +1,174 @@
+---
+# Host-level self-heal watchdog for the Docker daemon. Runs OUTSIDE Docker (as a
+# systemd timer) so it can recover the daemon the monitoring stack can't watch —
+# it also runs in Docker. On a down daemon it clears the latched failed state
+# (reset-failed) and restarts it; if that fails MAX_FAILURES times it reboots the
+# host (what fixed the 2026-07-16 wifi/docker race manually). Alerts Discord on
+# down / self-heal / recovery / reboot, reusing Alertmanager's webhook.
+- name: Setup Docker self-heal watchdog
+  hosts: all
+  become: true
+
+  vars:
+    docker_watchdog_script_path: /usr/local/bin/docker-watchdog.sh
+    docker_watchdog_state_dir: /var/lib/docker-watchdog
+    docker_watchdog_log_path: /var/log/docker-watchdog.log
+    # Reuse Alertmanager's Discord webhook (single source of truth, no secret in
+    # this repo). Path is where the home-lab-monitoring repo is cloned.
+    docker_watchdog_webhook_file: /home/monitoring/alertmanager/discord_webhook
+    docker_watchdog_max_failures: 3      # consecutive failed self-heal cycles before reboot
+    docker_watchdog_reboot_cooldown: 1800  # min seconds between reboots (anti-loop)
+
+  tasks:
+    - name: Create watchdog state directory
+      file:
+        path: "{{ docker_watchdog_state_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create watchdog log file
+      file:
+        path: "{{ docker_watchdog_log_path }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+      changed_when: false
+
+    - name: Deploy watchdog script
+      copy:
+        dest: "{{ docker_watchdog_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Managed by Ansible (playbooks/docker-watchdog.yml). Do not edit on host.
+          set -uo pipefail
+
+          WEBHOOK_FILE="{{ docker_watchdog_webhook_file }}"
+          STATE_DIR="{{ docker_watchdog_state_dir }}"
+          LOG="{{ docker_watchdog_log_path }}"
+          MAX_FAILURES={{ docker_watchdog_max_failures }}
+          REBOOT_COOLDOWN={{ docker_watchdog_reboot_cooldown }}
+
+          STATE_FILE="$STATE_DIR/state"                 # OK | FAIL
+          FAIL_FILE="$STATE_DIR/consecutive_failures"
+          LAST_REBOOT_FILE="$STATE_DIR/last_reboot"
+          HOST="$(hostname)"
+
+          mkdir -p "$STATE_DIR"
+          log() { echo "$(date -u +%FT%TZ) $*" >>"$LOG"; }
+
+          notify() {
+              [ -r "$WEBHOOK_FILE" ] || { log "webhook file $WEBHOOK_FILE unreadable, skip notify"; return; }
+              local url payload
+              url="$(head -n1 "$WEBHOOK_FILE")"
+              [ -n "$url" ] || { log "empty webhook url, skip notify"; return; }
+              payload="$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$1")"
+              curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$url" >/dev/null 2>&1 \
+                  || log "notify failed (network down?)"
+          }
+
+          docker_healthy() {
+              systemctl is-active --quiet docker.service || return 1
+              timeout 10 docker info >/dev/null 2>&1 || return 1
+              return 0
+          }
+
+          prev_state="$(cat "$STATE_FILE" 2>/dev/null || echo OK)"
+
+          if docker_healthy; then
+              if [ "$prev_state" = "FAIL" ]; then
+                  notify ":white_check_mark: **docker recovered** on \`$HOST\` — daemon is active again."
+                  log "recovered"
+              fi
+              echo OK >"$STATE_FILE"
+              echo 0  >"$FAIL_FILE"
+              exit 0
+          fi
+
+          # --- docker is DOWN ---
+          fails="$(cat "$FAIL_FILE" 2>/dev/null || echo 0)"
+          fails=$((fails + 1))
+          echo "$fails" >"$FAIL_FILE"
+          echo FAIL >"$STATE_FILE"
+          log "docker DOWN (consecutive failures=$fails)"
+
+          if [ "$prev_state" != "FAIL" ]; then
+              notify ":rotating_light: **docker is DOWN** on \`$HOST\` — attempting self-heal (reset-failed + start)."
+          fi
+
+          # Attempt self-heal: clear the latched failed state, then start.
+          systemctl reset-failed docker.service 2>>"$LOG" || true
+          systemctl start docker.service 2>>"$LOG" || true
+          sleep 15
+
+          if docker_healthy; then
+              notify ":white_check_mark: **docker self-healed** on \`$HOST\` after ${fails} attempt(s)."
+              log "self-healed after $fails attempts"
+              echo OK >"$STATE_FILE"
+              echo 0  >"$FAIL_FILE"
+              exit 0
+          fi
+
+          # Still down — escalate to reboot after MAX_FAILURES, rate-limited to avoid loops.
+          if [ "$fails" -ge "$MAX_FAILURES" ]; then
+              now=$(date +%s)
+              last_reboot="$(cat "$LAST_REBOOT_FILE" 2>/dev/null || echo 0)"
+              if [ $((now - last_reboot)) -ge "$REBOOT_COOLDOWN" ]; then
+                  echo "$now" >"$LAST_REBOOT_FILE"
+                  notify ":warning: **docker still DOWN** on \`$HOST\` after ${fails} self-heal attempts — **rebooting host** as last resort."
+                  log "escalating to reboot after $fails failures"
+                  systemctl reboot
+              else
+                  notify ":warning: **docker still DOWN** on \`$HOST\` after ${fails} attempts — reboot suppressed (cooldown); still retrying."
+                  log "reboot suppressed by cooldown"
+              fi
+          fi
+          exit 1
+
+    - name: Create watchdog systemd service
+      copy:
+        dest: /etc/systemd/system/docker-watchdog.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Docker self-heal watchdog (restart daemon / reboot host, alert Discord)
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ docker_watchdog_script_path }}
+
+    - name: Create watchdog systemd timer
+      copy:
+        dest: /etc/systemd/system/docker-watchdog.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Run the Docker self-heal watchdog every minute
+
+          [Timer]
+          # Delay first run so docker.service's own boot sequence (wait_for_network
+          # + retries, up to ~2min) finishes before the watchdog intervenes.
+          OnBootSec=3min
+          OnUnitActiveSec=1min
+          Unit=docker-watchdog.service
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start watchdog timer
+      systemd:
+        name: docker-watchdog.timer
+        enabled: true
+        state: started
+        daemon_reload: true
