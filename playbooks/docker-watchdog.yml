@@ -5,11 +5,23 @@
 # (reset-failed) and restarts it; if that fails MAX_FAILURES times it reboots the
 # host (what fixed the 2026-07-16 wifi/docker race manually). Alerts Discord on
 # down / self-heal / recovery / reboot, reusing Alertmanager's webhook.
+#
+# It ALSO probes pihole DNS reachability once the daemon is healthy. The
+# 2026-07-18 Tailscale-IP boot race can leave pihole running & "healthy" (its
+# healthcheck probes 127.0.0.1 *inside* the container) but detached from the
+# bridge with no published ports — a total DNS outage the healthcheck can't see.
+# This is ALERT-ONLY: it never recreates pihole, it just Discord-pings so the
+# outage can be fixed manually (recreate via `ansible-playbook playbooks/pihole.yml`).
 - name: Setup Docker self-heal watchdog
   hosts: all
   become: true
 
+  vars_files:
+    - ../vars/pihole.yml
+
   vars:
+    # LAN IP the watchdog sends a probe query to (single source of truth: vars/pihole.yml).
+    pihole_probe_ip: "{{ pihole_local_dns_ip }}"
     docker_watchdog_script_path: /usr/local/bin/docker-watchdog.sh
     docker_watchdog_state_dir: /var/lib/docker-watchdog
     docker_watchdog_log_path: /var/log/docker-watchdog.log
@@ -53,10 +65,12 @@
           LOG="{{ docker_watchdog_log_path }}"
           MAX_FAILURES={{ docker_watchdog_max_failures }}
           REBOOT_COOLDOWN={{ docker_watchdog_reboot_cooldown }}
+          PIHOLE_PROBE_IP="{{ pihole_probe_ip }}"
 
           STATE_FILE="$STATE_DIR/state"                 # OK | FAIL
           FAIL_FILE="$STATE_DIR/consecutive_failures"
           LAST_REBOOT_FILE="$STATE_DIR/last_reboot"
+          PIHOLE_STATE_FILE="$STATE_DIR/pihole_state"   # OK | FAIL
           HOST="$(hostname)"
 
           mkdir -p "$STATE_DIR"
@@ -78,6 +92,46 @@
               return 0
           }
 
+          # Is pihole answering DNS on the LAN IP? Queries pi.hole (served locally
+          # by FTL, no upstream needed), so this tests reachability of the listener
+          # itself — exactly the signature of the boot-race detach (no listener on
+          # :53 at all). Retries to ride out transient blips. Does NOT test upstream.
+          pihole_dns_ok() {
+              command -v dig >/dev/null 2>&1 || return 0   # no dig -> can't probe, don't false-alert
+              local i
+              for i in 1 2 3; do
+                  if dig +short +timeout=2 +tries=1 pi.hole @"$PIHOLE_PROBE_IP" >/dev/null 2>&1; then
+                      return 0
+                  fi
+                  sleep 2
+              done
+              return 1
+          }
+
+          # ALERT-ONLY pihole check. Runs when the daemon is healthy. Fires a
+          # Discord alert on OK->FAIL (with diagnostics) and a recovery note on
+          # FAIL->OK. Never recreates pihole — recovery is manual by design.
+          check_and_alert_pihole() {
+              docker inspect pihole >/dev/null 2>&1 || return 0   # pihole not defined here -> skip
+
+              local prev cur
+              prev="$(cat "$PIHOLE_STATE_FILE" 2>/dev/null || echo OK)"
+              if pihole_dns_ok; then cur=OK; else cur=FAIL; fi
+
+              if [ "$cur" = "FAIL" ] && [ "$prev" != "FAIL" ]; then
+                  local running nets ports
+                  running="$(docker inspect -f '{% raw %}{{.State.Running}}/{{.State.Health.Status}}{% endraw %}' pihole 2>/dev/null)"
+                  nets="$(docker inspect -f '{% raw %}{{json .NetworkSettings.Networks}}{% endraw %}' pihole 2>/dev/null)"
+                  ports="$(docker inspect -f '{% raw %}{{json .NetworkSettings.Ports}}{% endraw %}' pihole 2>/dev/null)"
+                  notify ":rotating_light: **pihole DNS not resolving** on \`$HOST\` — queries to ${PIHOLE_PROBE_IP} are failing (container may be running & \"healthy\" but network-detached). state=\`${running}\` networks=\`${nets}\` ports=\`${ports}\`. **Manual action needed** — likely the Tailscale-IP boot race; recreate with \`ansible-playbook playbooks/pihole.yml\`. Not auto-healing."
+                  log "pihole DNS FAIL: state=$running nets=$nets ports=$ports"
+              elif [ "$cur" = "OK" ] && [ "$prev" = "FAIL" ]; then
+                  notify ":white_check_mark: **pihole DNS recovered** on \`$HOST\` — LAN resolution working again."
+                  log "pihole DNS recovered"
+              fi
+              echo "$cur" >"$PIHOLE_STATE_FILE"
+          }
+
           prev_state="$(cat "$STATE_FILE" 2>/dev/null || echo OK)"
 
           if docker_healthy; then
@@ -87,6 +141,7 @@
               fi
               echo OK >"$STATE_FILE"
               echo 0  >"$FAIL_FILE"
+              check_and_alert_pihole
               exit 0
           fi
 
