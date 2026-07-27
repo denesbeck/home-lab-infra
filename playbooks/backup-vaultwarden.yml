@@ -96,10 +96,9 @@
           TMP_DIR="{{ backup_tmp_path }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           BACKUP_FILE="vaultwarden_${TIMESTAMP}.tar.gz"
-          LOG_FILE="{{ backup_log_path }}"
 
           log_message() {
-              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
           }
 
           cleanup() {

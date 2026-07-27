@@ -23,7 +23,11 @@
       when: not vaultwarden_backup_script.stat.exists
 
     - name: Take a pre-upgrade Vaultwarden backup
-      command: /usr/local/bin/backup-vaultwarden.sh
+      shell: |
+        set -o pipefail
+        /usr/local/bin/backup-vaultwarden.sh 2>&1 | tee -a /var/log/backup-vaultwarden.log
+      args:
+        executable: /bin/bash
       changed_when: true
 
 - name: Pull latest container images
