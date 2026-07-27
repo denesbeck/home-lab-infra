@@ -116,6 +116,7 @@
           log_message "Copying data directory"
           cp -r "$DATA_PATH" "$TMP_DIR/data"
           mv "$TMP_DIR/db-backup.sqlite3" "$TMP_DIR/data/db.sqlite3"
+          rm -f "$TMP_DIR/data/db.sqlite3-wal" "$TMP_DIR/data/db.sqlite3-shm"
 
           # Stamp the backup with the Vaultwarden version that produced it.
           # Schema migrations are forward-only: a newer binary upgrades an older
