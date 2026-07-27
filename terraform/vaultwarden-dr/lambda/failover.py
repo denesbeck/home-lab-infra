@@ -306,7 +306,12 @@ systemctl enable docker
 systemctl start docker
 
 curl -fsSL https://tailscale.com/install.sh | sh
-timeout 120 tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=vaultwarden-failover
+# --accept-dns=false is critical: the tailnet's global nameserver is the on-prem
+# Pi-hole, which is DOWN during a DR event (that's why we're failing over). If
+# Tailscale rewrites /etc/resolv.conf to point at it, every public DNS lookup
+# (S3, Cloudflare, certbot) dies. Keep the VPC resolver so failover stays
+# independent of the on-prem infra it's meant to replace.
+timeout 120 tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=vaultwarden-failover --accept-dns=false
 
 LATEST_BACKUP=$(aws s3api list-objects-v2 \
     --bucket "$S3_BACKUP_BUCKET" \
@@ -323,9 +328,30 @@ mkdir -p /tmp/vaultwarden-restore
 aws s3 cp "s3://$S3_BACKUP_BUCKET/$LATEST_BACKUP" /tmp/vaultwarden-restore/backup.tar.gz
 tar -xzf /tmp/vaultwarden-restore/backup.tar.gz -C /tmp/vaultwarden-restore
 
+# Run the Vaultwarden version that produced this backup, not whatever :latest
+# happens to be on the day of the outage. Schema migrations are forward-only,
+# and :latest is the one unpinned moving part left in the DR path (the AMI is
+# pinned deliberately) - an untested upstream release would break the failover
+# at exactly the moment it is needed. The backup stamps its own version.
+VW_VERSION="latest"
+if [ -s /tmp/vaultwarden-restore/VAULTWARDEN_VERSION ]; then
+    VW_VERSION=$(tr -d '[:space:]' < /tmp/vaultwarden-restore/VAULTWARDEN_VERSION)
+    [ -n "$VW_VERSION" ] || VW_VERSION="latest"
+fi
+VW_IMAGE="vaultwarden/server:${VW_VERSION}"
+
 mkdir -p /home/vaultwarden
 mv /tmp/vaultwarden-restore/data /home/vaultwarden/data
 rm -rf /tmp/vaultwarden-restore
+
+# A missing tag must not sink the failover. Falling back to :latest is the safe
+# direction (a newer binary migrates an older DB forward), but it means the
+# restore is no longer version-matched, so say so loudly.
+if ! timeout 300 docker pull "$VW_IMAGE"; then
+    notify_discord "**[Vaultwarden DR]** :warning: Could not pull \`$VW_IMAGE\` recorded in the backup; falling back to \`vaultwarden/server:latest\`. The restore is no longer version-matched - verify the vault after it comes up."
+    VW_IMAGE="vaultwarden/server:latest"
+    timeout 300 docker pull "$VW_IMAGE"
+fi
 
 TAILSCALE_IP=$(tailscale ip -4)
 
@@ -380,7 +406,7 @@ docker run -d \
     -e SIGNUPS_ALLOWED=false \
     -e INVITATIONS_ALLOWED=false \
     -e SHOW_PASSWORD_HINT=false \
-    vaultwarden/server:latest
+    "$VW_IMAGE"
 
 cat > /etc/nginx/conf.d/vaultwarden.conf <<NGINXEOF
 server {
@@ -415,7 +441,7 @@ echo "ready $(date -u +%FT%TZ) $INSTANCE_ID" | \
 kill "$LOG_SHIPPER_PID" 2>/dev/null || true
 flush_log
 
-notify_discord "Vaultwarden failover ready at \`https://$FAILOVER_DOMAIN\`. Backup restored: \`$LATEST_BACKUP\`. Tailscale IP: \`$TAILSCALE_IP\`"
+notify_discord "Vaultwarden failover ready at \`https://$FAILOVER_DOMAIN\`. Backup restored: \`$LATEST_BACKUP\` (image \`$VW_IMAGE\`). Tailscale IP: \`$TAILSCALE_IP\`"
 """
 
 

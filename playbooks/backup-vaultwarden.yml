@@ -92,6 +92,7 @@
 
           DATA_PATH="{{ vaultwarden_data_path }}"
           S3_BUCKET="{{ vaultwarden_backup_s3_bucket }}"
+          CONTAINER="{{ vaultwarden_container_name }}"
           TMP_DIR="{{ backup_tmp_path }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           BACKUP_FILE="vaultwarden_${TIMESTAMP}.tar.gz"
@@ -117,8 +118,25 @@
           cp -r "$DATA_PATH" "$TMP_DIR/data"
           mv "$TMP_DIR/db-backup.sqlite3" "$TMP_DIR/data/db.sqlite3"
 
+          # Stamp the backup with the Vaultwarden version that produced it.
+          # Schema migrations are forward-only: a newer binary upgrades an older
+          # DB, but an older binary cannot open a DB a newer one has migrated.
+          # The DR failover reads this file so it restores data and binary as a
+          # matched pair instead of gambling on whatever :latest is that day.
+          VW_VERSION=$(docker inspect \
+              --format '{{ '{{' }}index .Config.Labels "org.opencontainers.image.version"{{ '}}' }}' \
+              "$CONTAINER" 2>/dev/null || echo "")
+
+          if [ -z "$VW_VERSION" ] || [ "$VW_VERSION" = "<no value>" ]; then
+              log_message "WARNING: could not read Vaultwarden version label; recording 'latest'"
+              VW_VERSION="latest"
+          fi
+
+          echo "$VW_VERSION" > "$TMP_DIR/VAULTWARDEN_VERSION"
+          log_message "Backup taken from Vaultwarden $VW_VERSION"
+
           log_message "Compressing backup"
-          tar -czf "$TMP_DIR/$BACKUP_FILE" -C "$TMP_DIR" data
+          tar -czf "$TMP_DIR/$BACKUP_FILE" -C "$TMP_DIR" data VAULTWARDEN_VERSION
 
           log_message "Uploading to s3://$S3_BUCKET/$BACKUP_FILE"
           aws s3 cp "$TMP_DIR/$BACKUP_FILE" "s3://$S3_BUCKET/$BACKUP_FILE"
