@@ -1,4 +1,31 @@
 ---
+# Vaultwarden holds the password vault and its schema migrations are one-way:
+# the new binary migrates db.sqlite3 in place on first start, and rolling the
+# image back afterwards will not open the migrated DB. Take a fresh restore
+# point before anything is upgraded, and abort the whole run if it fails.
+- name: Snapshot Vaultwarden before upgrading any image
+  hosts: all
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Check the Vaultwarden backup script is deployed
+      stat:
+        path: /usr/local/bin/backup-vaultwarden.sh
+      register: vaultwarden_backup_script
+
+    - name: Fail when the Vaultwarden backup script is missing
+      fail:
+        msg: >-
+          /usr/local/bin/backup-vaultwarden.sh not found. Run
+          playbooks/backup-vaultwarden.yml first — the vault must have a fresh
+          pre-upgrade restore point before its image is replaced.
+      when: not vaultwarden_backup_script.stat.exists
+
+    - name: Take a pre-upgrade Vaultwarden backup
+      command: /usr/local/bin/backup-vaultwarden.sh
+      changed_when: true
+
 - name: Pull latest container images
   hosts: all
   become: true
@@ -19,6 +46,7 @@
         - "{{ pihole_image }}"
         - "{{ netalertx_image }}"
         - "{{ filebrowser_image }}"
+        - "{{ vaultwarden_image }}"
 
     - name: Pull latest images for monitoring stack
       command: docker compose pull
@@ -41,6 +69,7 @@
 - import_playbook: ./pihole.yml
 - import_playbook: ./netalertx.yml
 - import_playbook: ./filebrowser.yml
+- import_playbook: ./vaultwarden.yml
 
 - name: Clean up old images
   hosts: all
