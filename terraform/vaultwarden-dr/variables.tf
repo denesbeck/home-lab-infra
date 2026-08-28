@@ -13,10 +13,16 @@ variable "sns_email" {
   description = "Email address for failover notifications"
 }
 
-variable "tailscale_api_key" {
+variable "tailscale_oauth_client_id" {
   type        = string
   sensitive   = true
-  description = "Tailscale API key for generating one-time auth keys"
+  description = "Tailscale OAuth client ID (scope auth_keys, tag:failover); unlike API access tokens, OAuth client credentials don't expire"
+}
+
+variable "tailscale_oauth_client_secret" {
+  type        = string
+  sensitive   = true
+  description = "Tailscale OAuth client secret, exchanged at runtime for a short-lived access token to mint the failover auth key"
 }
 
 variable "discord_webhook_url" {

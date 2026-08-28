@@ -1,6 +1,7 @@
 s3_backup_bucket    = "vaultwarden-backup-XXXX"
 sns_email           = "you@example.com"
-tailscale_api_key   = "tskey-api-XXXX"
+tailscale_oauth_client_id     = "kXXXXXXXXXXXX"
+tailscale_oauth_client_secret = "tskey-client-XXXX"
 discord_webhook_url = "https://discord.com/api/webhooks/XXXX"
 cloudflare_api_token = "your-cloudflare-api-token"
 failover_domain      = "vaultwarden-failover.example.com"

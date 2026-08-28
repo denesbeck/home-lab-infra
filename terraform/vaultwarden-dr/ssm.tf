@@ -1,7 +1,13 @@
-resource "aws_ssm_parameter" "tailscale_api_key" {
-  name  = "/vaultwarden-dr/tailscale-api-key"
+resource "aws_ssm_parameter" "tailscale_oauth_client_id" {
+  name  = "/vaultwarden-dr/tailscale-oauth-client-id"
   type  = "SecureString"
-  value = var.tailscale_api_key
+  value = var.tailscale_oauth_client_id
+}
+
+resource "aws_ssm_parameter" "tailscale_oauth_client_secret" {
+  name  = "/vaultwarden-dr/tailscale-oauth-client-secret"
+  type  = "SecureString"
+  value = var.tailscale_oauth_client_secret
 }
 
 resource "aws_ssm_parameter" "discord_webhook_url" {

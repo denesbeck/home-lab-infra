@@ -3,6 +3,7 @@ import json
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -37,9 +38,9 @@ def _handle_failover(context):
         print("Failover instance already running, skipping")
         return
 
-    tailscale_key = _get_ssm_param(os.environ["SSM_TAILSCALE_KEY"])
     discord_webhook = _get_ssm_param(os.environ["SSM_DISCORD_WEBHOOK"])
-    tailscale_auth_key = _create_tailscale_auth_key(tailscale_key)
+    tailscale_access_token = _get_tailscale_access_token()
+    tailscale_auth_key = _create_tailscale_auth_key(tailscale_access_token)
 
     user_data = _build_user_data(
         tailscale_auth_key=tailscale_auth_key,
@@ -205,7 +206,34 @@ def _get_ssm_param(name):
     return response["Parameter"]["Value"]
 
 
-def _create_tailscale_auth_key(api_key):
+def _get_tailscale_access_token():
+    # OAuth client credentials instead of an API access token: access tokens
+    # expire after at most 90 days, which silently killed the 2026-08-26
+    # failover with a 401. OAuth client secrets don't expire.
+    client_id = _get_ssm_param(os.environ["SSM_TS_OAUTH_CLIENT_ID"])
+    client_secret = _get_ssm_param(os.environ["SSM_TS_OAUTH_CLIENT_SECRET"])
+
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.tailscale.com/api/v2/oauth/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["access_token"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"Tailscale OAuth token error {e.code}: {body}")
+        raise
+
+
+def _create_tailscale_auth_key(access_token):
     data = json.dumps({
         "capabilities": {
             "devices": {
@@ -223,7 +251,7 @@ def _create_tailscale_auth_key(api_key):
         "https://api.tailscale.com/api/v2/tailnet/-/keys",
         data=data,
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         },
     )
