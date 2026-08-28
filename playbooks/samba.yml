@@ -15,13 +15,15 @@
         name: smbgroup
         state: present
 
+    # Samba-only service account: it authenticates against smbpasswd, never
+    # against PAM, so it has no need for an interactive login shell.
     - name: Create samba user and group
       user:
         name: smbuser
         group: smbgroup
         state: present
         create_home: false
-        shell: /bin/bash
+        shell: /usr/sbin/nologin
 
     - import_tasks: ../tasks/generate-password.yml
 

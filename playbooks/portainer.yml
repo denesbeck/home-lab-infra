@@ -7,14 +7,31 @@
     - ../vars/containers.yml
 
   tasks:
+    # Holds portainer.key and the TLS keypair under certs/, so the directory
+    # must not be world-traversable. See the equivalent note in vaultwarden.yml.
     - name: Create Portainer data directory
       file:
         path: "{{ portainer_data_path }}"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         state: directory
-        mode: "0755"
+        mode: "u=rwX,g=rX,o="
         recurse: yes
+
+    - name: Find Portainer data files
+      find:
+        paths: "{{ portainer_data_path }}"
+        recurse: yes
+        file_type: file
+      register: portainer_data_files
+
+    - name: Restrict Portainer data file permissions
+      file:
+        path: "{{ item.path }}"
+        mode: "0640"
+      loop: "{{ portainer_data_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
 
     - name: Ensure Portainer container is running
       docker_container:

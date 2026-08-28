@@ -7,14 +7,34 @@
     - ../vars/containers.yml
 
   tasks:
+    # Holds db.sqlite3 and rsa_key.pem (JWT signing key), so the directory must
+    # not be world-traversable. "o=" on the directory is the durable control:
+    # Vaultwarden runs as root inside the container and recreates data files at
+    # runtime, so their individual modes drift, but nothing outside the owner
+    # can reach them through a 0750 parent.
     - name: Create Vaultwarden data directory
       file:
         path: "{{ vaultwarden_data_path }}"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         state: directory
-        mode: "0755"
+        mode: "u=rwX,g=rX,o="
         recurse: yes
+
+    - name: Find Vaultwarden data files
+      find:
+        paths: "{{ vaultwarden_data_path }}"
+        recurse: yes
+        file_type: file
+      register: vaultwarden_data_files
+
+    - name: Restrict Vaultwarden data file permissions
+      file:
+        path: "{{ item.path }}"
+        mode: "0640"
+      loop: "{{ vaultwarden_data_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
 
     - name: Ensure Vaultwarden container is running
       docker_container:

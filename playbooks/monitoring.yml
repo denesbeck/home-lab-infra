@@ -42,6 +42,28 @@
         group: "{{ ansible_user }}"
         recurse: yes
 
+    # analyzer/.env holds the Anthropic API key. It is gitignored upstream, so it
+    # survives `git pull` and its mode has to be enforced here. Compose reads it
+    # via env_file, which the Docker daemon parses as root, so dropping world
+    # read does not affect the container (which runs as uid 10001).
+    #
+    # Deliberately NOT tightened here: alertmanager/{analyzer_token,discord_webhook}
+    # are bind-mounted into claude-analyzer and readable by uid 10001 only via
+    # their o+r bit. Fixing those means changing group ownership or the compose
+    # `user:` in the home-lab-monitoring repo, not here.
+    - name: Check for analyzer environment file
+      stat:
+        path: /home/monitoring/analyzer/.env
+      register: analyzer_env_file
+
+    - name: Restrict analyzer environment file permissions
+      file:
+        path: /home/monitoring/analyzer/.env
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0640"
+      when: analyzer_env_file.stat.exists
+
     - name: Run git config command to add safe.directory
       command: git config --global --add safe.directory /home/monitoring
       args:
