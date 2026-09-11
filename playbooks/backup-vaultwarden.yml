@@ -151,9 +151,15 @@
         group: root
         mode: "0644"
 
+    # Runs at :30, not :00. The daily `shutdown -r now` cron in backup.yml
+    # fires at 03:00, so an on-the-hour backup starts while the network is
+    # being torn down and dies at the S3 upload with "Could not connect to
+    # the endpoint URL" — observed 2026-08-08/09/11/14/18/30 and 09-08/11,
+    # always at exactly 030001. The next hourly run recovers, but the script
+    # is `set -euo pipefail` so the failure only ever reaches a log file.
     - name: Setup hourly backup cronjob
       cron:
         name: "Hourly Vaultwarden backup to S3"
-        minute: "0"
+        minute: "30"
         job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
         state: present
