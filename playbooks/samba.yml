@@ -55,6 +55,44 @@
       notify:
         - Restart samba
 
+    # The samba package ships no logrotate rule here, and the stock one would
+    # not match the custom log path anyway.
+    - name: Deploy logrotate rule for Samba logs
+      copy:
+        dest: /etc/logrotate.d/samba
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          /var/log/samba/log.* {
+              weekly
+              rotate 4
+              missingok
+              notifempty
+              compress
+              delaycompress
+              sharedscripts
+              postrotate
+                  [ -f /run/samba/smbd.pid ] && kill -HUP "$(cat /run/samba/smbd.pid)" || true
+                  [ -f /run/samba/nmbd.pid ] && kill -HUP "$(cat /run/samba/nmbd.pid)" || true
+              endscript
+          }
+
+    # Cleans up the old %I%t.log backlog; anything not named log.* is from that
+    # scheme. No-op on every subsequent run.
+    - name: Remove legacy per-connection Samba logs
+      shell: |
+        set -o pipefail
+        count=$(find /var/log/samba -maxdepth 1 -type f ! -name 'log.*' -printf . | wc -c)
+        if [ "$count" -gt 0 ]; then
+            find /var/log/samba -maxdepth 1 -type f ! -name 'log.*' -delete
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
+      register: samba_legacy_logs
+      changed_when: samba_legacy_logs.stdout | trim | int > 0
+
   handlers:
     - name: Restart samba
       service:

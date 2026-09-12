@@ -21,7 +21,6 @@ Internet / Tailscale VPN
          ├──► qBittorrent    (:8081)   torrent client
          ├──► Filebrowser    (:8080)   web file manager
          ├──► Jellyfin       (:8096)   media server
-         ├──► NetAlertX      (host)    network scanner
          └──► Vaultwarden    (:8888)   password manager
 ```
 
@@ -47,7 +46,6 @@ graph TD
             E4[qBittorrent :8081]
             E5[Filebrowser :8080]
             E6[Jellyfin :8096]
-            E7[NetAlertX<br/>host network]
             E8[Vaultwarden :8888]
         end
 
@@ -71,7 +69,7 @@ graph TD
     A1 & A2 --> B
     B --> C
     C --> D
-    D -->|127.0.0.1| E1 & E2 & E3 & E4 & E5 & E6 & E7 & E8
+    D -->|127.0.0.1| E1 & E2 & E3 & E4 & E5 & E6 & E8
     E5 --> G1 & G2 & G3
     E6 --> G3
     E4 --> G3
@@ -90,7 +88,6 @@ graph TD
 | **qBittorrent** | Docker | `qbittorrent.arcade-lab.io` | BitTorrent client |
 | **Filebrowser** | Docker | `filebrowser.arcade-lab.io` | Web-based file manager for movies, photos, and private storage |
 | **Jellyfin** | Docker | `jellyfin.arcade-lab.io` | Media server (4GB RAM, 4 CPU limit) |
-| **NetAlertX** | Docker | `netalertx.arcade-lab.io` | Network scanner and alerter (host network mode) |
 | **Vaultwarden** | Docker | `vaultwarden.arcade-lab.io` | Self-hosted Bitwarden-compatible password manager |
 | **NGINX** | Native | — | Reverse proxy with SSL for all services |
 | **Samba** | Native | — | SMB3 file sharing (3 shares: private, photos, movies) |
@@ -119,7 +116,6 @@ graph TD
 │   ├── filebrowser.yml      # Filebrowser container
 │   ├── jellyfin.yml         # Jellyfin media server container
 │   ├── monitoring.yml       # Prometheus/Grafana stack
-│   ├── netalertx.yml        # NetAlertX network scanner container
 │   ├── nginx.yml            # NGINX reverse proxy + SSL
 │   ├── pihole.yml           # Pi-hole DNS container
 │   ├── portainer.yml        # Portainer container
@@ -162,7 +158,6 @@ graph TD
     ├── fstab.yml
     ├── containers.yml       # Container names and image tags (shared by all service playbooks)
     ├── jellyfin.yml
-    ├── netalertx.yml
     ├── pihole.yml
     ├── portainer.yml
     ├── ssh.yml
@@ -198,7 +193,6 @@ Run any service playbook independently:
 ```bash
 ansible-playbook playbooks/pihole.yml
 ansible-playbook playbooks/jellyfin.yml
-ansible-playbook playbooks/netalertx.yml
 ansible-playbook playbooks/tailscale.yml
 ansible-playbook playbooks/vaultwarden.yml
 ansible-playbook playbooks/ups-monitor.yml
@@ -206,7 +200,7 @@ ansible-playbook playbooks/backup-vaultwarden.yml
 ansible-playbook playbooks/cloudwatch-agent.yml
 ```
 
-> **Note:** Pi-hole, Jellyfin, NetAlertX, Tailscale, Vaultwarden, UPS Monitor, Vaultwarden backup, and CloudWatch agent are not included in `main.yml` and must be run separately.
+> **Note:** Pi-hole, Jellyfin, Tailscale, Vaultwarden, UPS Monitor, Vaultwarden backup, and CloudWatch agent are not included in `main.yml` and must be run separately.
 
 ### Utility tasks
 
@@ -231,7 +225,6 @@ All variable files live in `vars/` and are gitignored to protect secrets. You ne
 | `vars/containers.yml` | Container names and image tags for all Docker services |
 | `vars/pihole.yml` | DNS config, local DNS records, ports |
 | `vars/jellyfin.yml` | Timezone, paths, resource limits |
-| `vars/netalertx.yml` | Port, timezone, data path |
 | `vars/qbittorrent.yml` | Ports, paths, timezone |
 | `vars/filebrowser.yml` | Paths |
 | `vars/portainer.yml` | Data path |

@@ -66,6 +66,25 @@
         groups: docker
         append: yes
 
+    # json-file keeps every container's stdout forever by default. Set on the
+    # daemon so it also covers the monitoring repo's compose containers. Applies
+    # at container creation only — existing ones convert when recreated.
+    - name: Set daemon-wide container log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+      register: docker_daemon_config
+
     - name: Create Docker systemd override directory
       file:
         path: /etc/systemd/system/docker.service.d
@@ -103,7 +122,17 @@
         daemon_reload: yes
       when: docker_override.changed
 
-    - name: Restart Docker service
+    - name: Ensure Docker is running and enabled at boot
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # A restart takes every container down, Pi-hole included, so it is a LAN DNS
+    # outage. Only do it when config actually changed; the task above still
+    # guarantees the daemon is up.
+    - name: Restart Docker service to pick up config changes
       service:
         name: docker
         state: restarted
+      when: docker_override.changed or docker_daemon_config.changed

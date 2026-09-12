@@ -38,6 +38,22 @@
         interface: tailscale0
         direction: in
 
+    # Without this, default-deny drops container -> host :53 and every container
+    # silently falls back to the 8.8.8.8 in its resolv.conf, bypassing Pi-hole.
+    # Matched on Docker's subnet pool, not the interface, so it survives compose
+    # recreating its network and renaming br-<hash>.
+    - name: Allow container DNS queries to Pi-hole on the Docker bridges
+      ufw:
+        rule: allow
+        direction: in
+        from_ip: 172.16.0.0/12
+        to_port: "53"
+        proto: "{{ item }}"
+        comment: "Docker containers -> Pi-hole DNS"
+      loop:
+        - udp
+        - tcp
+
     - name: Reload UFW to apply changes
       ufw:
         state: reloaded

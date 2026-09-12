@@ -10,6 +10,10 @@
     backup_script_path: /usr/local/bin/backup-vaultwarden.sh
     backup_log_path: /var/log/backup-vaultwarden.log
     backup_tmp_path: /tmp/vaultwarden-backup
+    # Reuse Alertmanager's webhook so no secret lives in this repo.
+    backup_webhook_file: /home/monitoring/alertmanager/discord_webhook
+    backup_metrics_dir: /var/lib/node-exporter/textfile
+    backup_metrics_file: /var/lib/node-exporter/textfile/vaultwarden_backup.prom
 
   tasks:
     - name: Check if AWS CLI v2 is installed
@@ -80,6 +84,15 @@
           [default]
           region = {{ vaultwarden_backup_s3_region }}
 
+    # Shared with the UPS monitor; created here so this playbook stands alone.
+    - name: Ensure textfile collector directory exists
+      file:
+        path: "{{ backup_metrics_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Create backup script
       copy:
         dest: "{{ backup_script_path }}"
@@ -88,12 +101,16 @@
         group: root
         content: |
           #!/bin/bash
-          set -euo pipefail
+          # -E so the ERR trap is inherited by functions and subshells.
+          set -Eeuo pipefail
 
           DATA_PATH="{{ vaultwarden_data_path }}"
           S3_BUCKET="{{ vaultwarden_backup_s3_bucket }}"
           CONTAINER="{{ vaultwarden_container_name }}"
           TMP_DIR="{{ backup_tmp_path }}"
+          WEBHOOK_FILE="{{ backup_webhook_file }}"
+          METRICS_FILE="{{ backup_metrics_file }}"
+          HOST="$(hostname)"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           BACKUP_FILE="vaultwarden_${TIMESTAMP}.tar.gz"
 
@@ -101,10 +118,69 @@
               echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
           }
 
+          read_metric() {
+              [ -r "$METRICS_FILE" ] || { echo 0; return 0; }
+              awk -v k="$1" '$1 == k { v = $2 } END { print (v == "" ? 0 : v) }' "$METRICS_FILE"
+          }
+
+          # Carried forward so a failed run does not erase the last-success
+          # timestamp the staleness alert reads.
+          LAST_SUCCESS="$(read_metric vaultwarden_backup_last_success_timestamp_seconds)"
+          LAST_SIZE="$(read_metric vaultwarden_backup_size_bytes)"
+          PREV_RUN="$(read_metric vaultwarden_backup_last_run_timestamp_seconds)"
+          PREV_SUCCESS="$(read_metric vaultwarden_backup_success)"
+
+          write_metrics() {
+              local success="$1"
+              printf '%s\n' \
+                  "# HELP vaultwarden_backup_success Whether the most recent backup run succeeded (1 = yes, 0 = no)." \
+                  "# TYPE vaultwarden_backup_success gauge" \
+                  "vaultwarden_backup_success ${success}" \
+                  "# HELP vaultwarden_backup_last_run_timestamp_seconds Unix time of the most recent backup attempt." \
+                  "# TYPE vaultwarden_backup_last_run_timestamp_seconds gauge" \
+                  "vaultwarden_backup_last_run_timestamp_seconds $(date +%s)" \
+                  "# HELP vaultwarden_backup_last_success_timestamp_seconds Unix time of the last backup that reached S3." \
+                  "# TYPE vaultwarden_backup_last_success_timestamp_seconds gauge" \
+                  "vaultwarden_backup_last_success_timestamp_seconds ${LAST_SUCCESS}" \
+                  "# HELP vaultwarden_backup_size_bytes Size of the last archive that reached S3." \
+                  "# TYPE vaultwarden_backup_size_bytes gauge" \
+                  "vaultwarden_backup_size_bytes ${LAST_SIZE}" \
+                  > "${METRICS_FILE}.tmp"
+              chmod 0644 "${METRICS_FILE}.tmp"
+              mv "${METRICS_FILE}.tmp" "$METRICS_FILE"
+          }
+
+          notify() {
+              [ -r "$WEBHOOK_FILE" ] || { log_message "webhook file $WEBHOOK_FILE unreadable, skip notify"; return 0; }
+              local url payload
+              url="$(head -n1 "$WEBHOOK_FILE")"
+              [ -n "$url" ] || { log_message "empty webhook url, skip notify"; return 0; }
+              payload="$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$1")"
+              curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$url" >/dev/null 2>&1 \
+                  || log_message "notify failed (network down?)"
+              return 0
+          }
+
           cleanup() {
               rm -rf "$TMP_DIR"
           }
+
+          # Failures used to reach a log file and nowhere else. The stale
+          # last-success metric covers what this cannot: cron never firing.
+          on_error() {
+              local rc=$?
+              local line="$1"
+              set +e
+              log_message "ERROR: backup failed with exit $rc at line $line"
+              write_metrics 0
+              local stale="never"
+              [ "$LAST_SUCCESS" != "0" ] && stale="$(date -u -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M:%S UTC')"
+              notify ":rotating_light: **Vaultwarden backup FAILED** on \`$HOST\` — exit $rc at line $line. Last backup that reached S3: \`$stale\`. Log: \`{{ backup_log_path }}\`"
+              exit "$rc"
+          }
+
           trap cleanup EXIT
+          trap 'on_error $LINENO' ERR
 
           mkdir -p "$TMP_DIR"
 
@@ -140,6 +216,16 @@
 
           log_message "Uploading to s3://$S3_BUCKET/$BACKUP_FILE"
           aws s3 cp "$TMP_DIR/$BACKUP_FILE" "s3://$S3_BUCKET/$BACKUP_FILE"
+
+          LAST_SUCCESS="$(date +%s)"
+          LAST_SIZE="$(stat -c %s "$TMP_DIR/$BACKUP_FILE")"
+          write_metrics 1
+
+          # PREV_RUN guard: on the first ever run every metric reads 0, which is
+          # not a recovery.
+          if [ "$PREV_RUN" != "0" ] && [ "$PREV_SUCCESS" = "0" ]; then
+              notify ":white_check_mark: **Vaultwarden backup recovered** on \`$HOST\` — upload succeeded again."
+          fi
 
           log_message "Backup completed successfully"
 

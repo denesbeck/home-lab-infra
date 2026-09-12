@@ -48,7 +48,6 @@
         - "{{ qbittorrent_image }}"
         - "{{ portainer_image }}"
         - "{{ pihole_image }}"
-        - "{{ netalertx_image }}"
         - "{{ filebrowser_image }}"
         - "{{ vaultwarden_image }}"
 
@@ -71,7 +70,6 @@
 - import_playbook: ./qbittorrent.yml
 - import_playbook: ./portainer.yml
 - import_playbook: ./pihole.yml
-- import_playbook: ./netalertx.yml
 - import_playbook: ./filebrowser.yml
 - import_playbook: ./vaultwarden.yml
 
