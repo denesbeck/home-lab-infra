@@ -21,3 +21,7 @@ terraform/vaultwarden-dr/*.tfstate.backup
 terraform/vaultwarden-dr/*.tfplan
 terraform/vaultwarden-dr/terraform.tfvars
 terraform/vaultwarden-dr/lambda/*.zip
+
+# python bytecode (from syntax-checking the lambda locally)
+__pycache__/
+*.pyc

@@ -25,12 +25,79 @@ def handler(event, context):
     state = message.get("NewStateValue")
 
     if state == "ALARM":
+        suppressed, reason = _failover_mode()
+        if suppressed:
+            return _handle_suppressed(reason)
         return _handle_failover(context)
     elif state == "OK":
+        # Teardown is never suppressed: if an instance is up, recovery must
+        # still terminate it and hand DNS back.
         return _handle_teardown()
     else:
         print(f"Ignoring state: {state}")
         return
+
+
+def _failover_mode():
+    """Read the maintenance switch. Returns (suppressed, reason).
+
+    Accepts `auto`, `off`, or an RFC3339 instant meaning "maintenance until".
+    Fail-safe by design: an unreadable, missing or unparseable value returns
+    NOT suppressed, because a broken switch must never silently leave the
+    vault without DR.
+    """
+    name = os.environ.get("SSM_FAILOVER_MODE")
+    if not name:
+        return False, "no switch configured"
+
+    try:
+        raw = _get_ssm_param(name).strip()
+    except Exception as exc:
+        print(f"WARNING: cannot read {name} ({exc}); proceeding with failover")
+        return False, "switch unreadable"
+
+    if raw.lower() == "auto":
+        return False, "auto"
+    if raw.lower() == "off":
+        return True, "switch set to off, with no expiry"
+
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        print(f"WARNING: cannot parse {name}={raw!r}; proceeding with failover")
+        return False, "switch unparseable"
+
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+
+    if datetime.now(timezone.utc) < until:
+        return True, f"maintenance until {until.isoformat()}"
+    return False, f"maintenance window expired at {until.isoformat()}"
+
+
+def _handle_suppressed(reason):
+    switch = os.environ.get("SSM_FAILOVER_MODE", "<unset>")
+    msg = (
+        f"[Vaultwarden DR] Heartbeat alarm fired but failover is SUPPRESSED ({reason}).\n\n"
+        f"No instance was launched and DNS was not changed — the vault has no DR "
+        f"cover until the switch returns to auto.\n\n"
+        f"If this is not planned maintenance, re-enable it now:\n"
+        f"  aws ssm put-parameter --name {switch} --value auto --overwrite"
+    )
+    print(msg)
+
+    _notify_sns("Vaultwarden DR - FAILOVER SUPPRESSED", msg)
+    try:
+        _notify_discord(
+            _get_ssm_param(os.environ["SSM_DISCORD_WEBHOOK"]),
+            f":construction: **[Vaultwarden DR]** Heartbeat alarm fired but failover is "
+            f"**SUPPRESSED** ({reason}). No DR instance launched. Re-enable with "
+            f"`aws ssm put-parameter --name {switch} --value auto --overwrite`",
+        )
+    except Exception as exc:
+        print(f"Discord notify failed: {exc}")
+
+    return {"status": "suppressed", "reason": reason}
 
 
 def _handle_failover(context):

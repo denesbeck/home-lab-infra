@@ -21,3 +21,18 @@ resource "aws_ssm_parameter" "cloudflare_api_token" {
   type  = "SecureString"
   value = var.cloudflare_api_token
 }
+
+# Maintenance switch, read by the Lambda on every alarm. `auto` is normal;
+# an RFC3339 instant suppresses failover until then; `off` suppresses with no
+# expiry. Runtime state, not config — ignore_changes keeps a terraform apply
+# from cancelling an in-flight maintenance window (or re-arming one you ended).
+resource "aws_ssm_parameter" "failover_mode" {
+  name        = "/vaultwarden-dr/failover-mode"
+  type        = "String"
+  value       = "auto"
+  description = "auto | off | RFC3339 instant to suppress failover until"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}

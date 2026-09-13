@@ -19,6 +19,7 @@ resource "aws_lambda_function" "failover" {
       SSM_TS_OAUTH_CLIENT_ID     = aws_ssm_parameter.tailscale_oauth_client_id.name
       SSM_TS_OAUTH_CLIENT_SECRET = aws_ssm_parameter.tailscale_oauth_client_secret.name
       SSM_DISCORD_WEBHOOK        = aws_ssm_parameter.discord_webhook_url.name
+      SSM_FAILOVER_MODE          = aws_ssm_parameter.failover_mode.name
       S3_BACKUP_BUCKET           = var.s3_backup_bucket
       SNS_NOTIFICATIONS_ARN      = aws_sns_topic.vaultwarden_notifications.arn
       FAILOVER_DOMAIN            = var.failover_domain

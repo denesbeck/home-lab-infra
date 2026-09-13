@@ -58,7 +58,8 @@ resource "aws_iam_role_policy" "lambda_failover" {
         Resource = [
           aws_ssm_parameter.tailscale_oauth_client_id.arn,
           aws_ssm_parameter.tailscale_oauth_client_secret.arn,
-          aws_ssm_parameter.discord_webhook_url.arn
+          aws_ssm_parameter.discord_webhook_url.arn,
+          aws_ssm_parameter.failover_mode.arn
         ]
       },
       {
