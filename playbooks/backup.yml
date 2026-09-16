@@ -10,7 +10,7 @@
     backup_log_path: /var/log/backup-photos.log
     backup_metrics_dir: /var/lib/node-exporter/textfile
     backup_metrics_file: /var/lib/node-exporter/textfile/photos_backup.prom
-    backup_retain: 3
+    backup_retain: 30
     backup_user: "{{ ansible_user }}"
     backup_group: "{{ ansible_user }}"
 
