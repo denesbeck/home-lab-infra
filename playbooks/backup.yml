@@ -7,6 +7,10 @@
     backup_source: /mnt/photos
     backup_destination: /mnt/backups
     backup_script_path: /usr/local/bin/backup-photos.sh
+    backup_log_path: /var/log/backup-photos.log
+    backup_metrics_dir: /var/lib/node-exporter/textfile
+    backup_metrics_file: /var/lib/node-exporter/textfile/photos_backup.prom
+    backup_retain: 3
     backup_user: "{{ ansible_user }}"
     backup_group: "{{ ansible_user }}"
 
@@ -19,6 +23,14 @@
         group: "{{ backup_group }}"
         mode: "0755"
 
+    - name: Ensure textfile collector directory exists
+      file:
+        path: "{{ backup_metrics_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Create backup script
       copy:
         dest: "{{ backup_script_path }}"
@@ -27,62 +39,119 @@
         group: root
         content: |
           #!/bin/bash
-
-          # Photo backup script with rotation
-          # Backs up {{ backup_source }} to {{ backup_destination }}/photos_<timestamp>
-          # Keeps only the last 3 backups
-
-          set -euo pipefail
+          # -E so the ERR trap is inherited by functions and subshells.
+          set -Eeuo pipefail
 
           SOURCE="{{ backup_source }}"
           BACKUP_BASE="{{ backup_destination }}"
+          METRICS_FILE="{{ backup_metrics_file }}"
+          RETAIN={{ backup_retain }}
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           BACKUP_DIR="${BACKUP_BASE}/photos_${TIMESTAMP}"
-          LOG_FILE="/var/log/backup-photos.log"
 
-          # Function to log messages
+          # stdout only -- cron redirects to the log; tee'ing as well wrote every line twice.
           log_message() {
-              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
           }
 
-          # Check if source directory exists
-          if [[ ! -d "$SOURCE" ]]; then
-              log_message "ERROR: Source directory $SOURCE does not exist"
+          read_metric() {
+              [ -r "$METRICS_FILE" ] || { echo 0; return 0; }
+              awk -v k="$1" '$1 == k { v = $2 } END { print (v == "" ? 0 : v) }' "$METRICS_FILE"
+          }
+
+          # Carried forward so a failed run keeps the timestamp the staleness alert reads.
+          LAST_SUCCESS="$(read_metric photos_backup_last_success_timestamp_seconds)"
+          LAST_SIZE="$(read_metric photos_backup_size_bytes)"
+          LAST_FILES="$(read_metric photos_backup_file_count)"
+
+          write_metrics() {
+              local success="$1"
+              printf '%s\n' \
+                  "# HELP photos_backup_success Whether the most recent backup run succeeded (1 = yes, 0 = no)." \
+                  "# TYPE photos_backup_success gauge" \
+                  "photos_backup_success ${success}" \
+                  "# HELP photos_backup_last_run_timestamp_seconds Unix time of the most recent backup attempt." \
+                  "# TYPE photos_backup_last_run_timestamp_seconds gauge" \
+                  "photos_backup_last_run_timestamp_seconds $(date +%s)" \
+                  "# HELP photos_backup_last_success_timestamp_seconds Unix time of the last snapshot that completed and passed verification." \
+                  "# TYPE photos_backup_last_success_timestamp_seconds gauge" \
+                  "photos_backup_last_success_timestamp_seconds ${LAST_SUCCESS}" \
+                  "# HELP photos_backup_size_bytes Size of the last verified snapshot." \
+                  "# TYPE photos_backup_size_bytes gauge" \
+                  "photos_backup_size_bytes ${LAST_SIZE}" \
+                  "# HELP photos_backup_file_count Regular files in the last verified snapshot." \
+                  "# TYPE photos_backup_file_count gauge" \
+                  "photos_backup_file_count ${LAST_FILES}" \
+                  > "${METRICS_FILE}.tmp"
+              chmod 0644 "${METRICS_FILE}.tmp"
+              mv "${METRICS_FILE}.tmp" "$METRICS_FILE"
+          }
+
+          on_error() {
+              local rc=$?
+              local line="$1"
+              set +e
+              log_message "ERROR: backup failed with exit $rc at line $line"
+              write_metrics 0
+              exit "$rc"
+          }
+
+          trap 'on_error $LINENO' ERR
+
+          # `-d` is not a mount check: both paths exist as empty directories on the
+          # root filesystem when their USB enclosure is absent.
+          require_mounted() {
+              local target="$1"
+              if ! findmnt --noheadings --mountpoint "$target" >/dev/null 2>&1; then
+                  log_message "ERROR: $target is not a mounted filesystem - aborting"
+                  write_metrics 0
+                  exit 1
+              fi
+          }
+
+          require_mounted "$SOURCE"
+          require_mounted "$BACKUP_BASE"
+
+          SRC_FILES=$(find "$SOURCE" -type f | wc -l)
+          if [ "$SRC_FILES" -eq 0 ]; then
+              log_message "ERROR: $SOURCE is mounted but contains no files - aborting rather than snapshotting an empty library"
+              write_metrics 0
               exit 1
           fi
 
-          # Check if backup base directory exists
-          if [[ ! -d "$BACKUP_BASE" ]]; then
-              log_message "ERROR: Backup base directory $BACKUP_BASE does not exist"
-              exit 1
-          fi
+          log_message "Starting backup of $SOURCE ($SRC_FILES files) to $BACKUP_DIR"
 
-          log_message "Starting backup of $SOURCE to $BACKUP_DIR"
-
-          # Create backup directory
           mkdir -p "$BACKUP_DIR"
+          chown {{ ansible_user }}:{{ ansible_user }} "$BACKUP_DIR"
 
-          # Make sure that the backup directory is owned by the ansible_user
-          chown {{ ansible_user }}:{{ ansible_user }} $BACKUP_DIR
-
-          # Perform backup using rsync
           if rsync -aAXHvS "$SOURCE/" "$BACKUP_DIR/"; then
-              log_message "Backup completed successfully to $BACKUP_DIR"
+              log_message "rsync completed to $BACKUP_DIR"
           else
-              log_message "ERROR: Backup failed"
-              # Clean up failed backup directory
+              log_message "ERROR: rsync failed"
               rm -rf "$BACKUP_DIR"
+              write_metrics 0
               exit 1
           fi
 
-          # Rotation: Keep only the last 3 backups
-          log_message "Starting backup rotation (keeping last 3 backups)"
+          # Rotation deletes real backups, so only run it on a complete snapshot.
+          DST_FILES=$(find "$BACKUP_DIR" -type f | wc -l)
+          if [ "$DST_FILES" -lt "$SRC_FILES" ]; then
+              log_message "ERROR: snapshot has $DST_FILES of $SRC_FILES files - keeping it for inspection and refusing to rotate"
+              write_metrics 0
+              exit 1
+          fi
 
-          # Find all photo backup directories and sort by modification time (newest first)
-          # Then skip the first 3 (keep them) and delete the rest
+          LAST_SUCCESS="$(date +%s)"
+          LAST_SIZE="$(du -sb "$BACKUP_DIR" | cut -f1)"
+          LAST_FILES="$DST_FILES"
+          log_message "Verified snapshot: $DST_FILES files, $LAST_SIZE bytes"
+
+          log_message "Starting backup rotation (keeping last $RETAIN)"
+
+          # Fixed-width photos_YYYYMMDDHHMMSS names, so reverse sort is newest-first.
           find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" | \
-              sort -nr | \
-              tail -n +4 | \
+              sort -r | \
+              tail -n "+$((RETAIN + 1))" | \
               while IFS= read -r old_backup; do
                   if [[ -n "$old_backup" && "$old_backup" != "$BACKUP_BASE" ]]; then
                       log_message "Removing old backup: $old_backup"
@@ -92,15 +161,15 @@
 
           log_message "Backup rotation completed"
 
-          # Show current backups
           log_message "Current backups:"
-          find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r | tee -a "$LOG_FILE"
+          find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r
 
+          write_metrics 1
           log_message "Backup process finished successfully"
 
     - name: Create log file with proper permissions
       file:
-        path: /var/log/backup-photos.log
+        path: "{{ backup_log_path }}"
         state: touch
         owner: "root"
         group: "root"
@@ -111,7 +180,7 @@
         name: "Daily photo backup"
         minute: "0"
         hour: "1"
-        job: "{{ backup_script_path }} >> /var/log/backup-photos.log 2>&1"
+        job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
         state: present
 
     - name: Setup daily restart cronjob at 3 AM
@@ -135,5 +204,6 @@
           - "Source directory: {{ backup_source }}"
           - "Backup destination: {{ backup_destination }}"
           - "Cronjob scheduled: Daily at 1:00 AM"
-          - "Log file: /var/log/backup-photos.log"
-          - "Backup retention: Last 3 backups"
+          - "Log file: {{ backup_log_path }}"
+          - "Metrics file: {{ backup_metrics_file }}"
+          - "Backup retention: Last {{ backup_retain }} backups"

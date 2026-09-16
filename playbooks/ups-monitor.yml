@@ -42,11 +42,11 @@
           ROUTER_IP="{{ router_ip }}"
           PING_INTERVAL={{ ping_interval }}
           MAX_FAILURES={{ max_failures }}
-          LOG_FILE="{{ power_monitor_log }}"
           METRICS_FILE="{{ power_monitor_metrics_file }}"
 
+          # stdout only -- cron redirects to the log; tee'ing as well wrote every line twice.
           log_message() {
-              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
           }
 
           write_metrics() {

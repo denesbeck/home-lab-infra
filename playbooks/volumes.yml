@@ -4,6 +4,15 @@
   become: true
   vars_files:
     - ../vars/fstab.yml
+
+  vars:
+    mount_retry_script_path: /usr/local/bin/mount-retry.sh
+    managed_mounts:
+      - /mnt/private
+      - /mnt/photos
+      - /mnt/movies
+      - /mnt/backups
+
   tasks:
     - name: Create directories
       file:
@@ -12,11 +21,7 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: "0755"
-      loop:
-        - /mnt/private
-        - /mnt/photos
-        - /mnt/movies
-        - /mnt/backups
+      loop: "{{ managed_mounts }}"
 
     - name: Set permissions directories
       file:
@@ -25,15 +30,14 @@
         group: "{{ ansible_user }}"
         mode: "0755"
         recurse: yes
-      loop:
-        - /mnt/private
-        - /mnt/photos
-        - /mnt/movies
-        - /mnt/backups
+      loop: "{{ managed_mounts }}"
 
+    # regexp matches the mount point so changed options replace the entry
+    # instead of appending a duplicate.
     - name: Add /mnt/private to /etc/fstab
       lineinfile:
         path: /etc/fstab
+        regexp: '\s/mnt/private\s'
         line: "{{ private_mount }}"
         create: yes
         state: present
@@ -41,6 +45,7 @@
     - name: Add /mnt/photos to /etc/fstab
       lineinfile:
         path: /etc/fstab
+        regexp: '\s/mnt/photos\s'
         line: "{{ photos_mount }}"
         create: yes
         state: present
@@ -48,6 +53,7 @@
     - name: Add /mnt/movies to /etc/fstab
       lineinfile:
         path: /etc/fstab
+        regexp: '\s/mnt/movies\s'
         line: "{{ movies_mount }}"
         create: yes
         state: present
@@ -55,6 +61,67 @@
     - name: Add /mnt/backups to /etc/fstab
       lineinfile:
         path: /etc/fstab
+        regexp: '\s/mnt/backups\s'
         line: "{{ backups_mount }}"
         create: yes
         state: present
+
+    # systemd never retries a mount whose device was absent at boot. Not
+    # x-systemd.automount: an autofs trigger resolves once at Docker bind-mount
+    # time and would hand containers an empty directory.
+    - name: Create mount retry script
+      copy:
+        dest: "{{ mount_retry_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -uo pipefail
+
+          for target in {{ managed_mounts | join(' ') }}; do
+              findmnt --noheadings --mountpoint "$target" >/dev/null 2>&1 && continue
+              if mount "$target" >/dev/null 2>&1; then
+                  logger -t mount-retry "mounted $target"
+              fi
+          done
+
+    - name: Create mount retry systemd service
+      copy:
+        dest: /etc/systemd/system/mount-retry.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Re-attempt fstab mounts whose device was late to enumerate
+          After=local-fs.target
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ mount_retry_script_path }}
+
+    - name: Create mount retry systemd timer
+      copy:
+        dest: /etc/systemd/system/mount-retry.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Retry late fstab mounts every minute
+
+          [Timer]
+          OnBootSec=1min
+          OnUnitActiveSec=1min
+          Unit=mount-retry.service
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start mount retry timer
+      systemd:
+        name: mount-retry.timer
+        enabled: true
+        state: started
+        daemon_reload: true
