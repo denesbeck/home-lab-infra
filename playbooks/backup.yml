@@ -119,12 +119,34 @@
               exit 1
           fi
 
+          # Newest snapshot that actually holds files, used as the hardlink source:
+          # anything unchanged since then costs a link() instead of a copy. Chosen
+          # before $BACKUP_DIR exists so it cannot pick itself. A stale or partial
+          # reference is safe -- rsync just copies whatever does not match it.
+          LINK_DEST=""
+          while IFS= read -r candidate; do
+              if [ -n "$(find "$candidate" -type f -print -quit 2>/dev/null)" ]; then
+                  LINK_DEST="$candidate"
+                  break
+              fi
+          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" | sort -r)
+
+          RSYNC_OPTS=(-aAXHS --stats)
+          if [ -n "$LINK_DEST" ]; then
+              RSYNC_OPTS+=(--link-dest="$LINK_DEST")
+              log_message "Hardlinking unchanged files against $(basename "$LINK_DEST")"
+          else
+              log_message "No previous snapshot found - this run copies in full"
+          fi
+
           log_message "Starting backup of $SOURCE ($SRC_FILES files) to $BACKUP_DIR"
 
           mkdir -p "$BACKUP_DIR"
           chown {{ ansible_user }}:{{ ansible_user }} "$BACKUP_DIR"
 
-          if rsync -aAXHvS "$SOURCE/" "$BACKUP_DIR/"; then
+          # -v listed all 15k files every night even when every one was a link;
+          # --stats keeps the transfer summary without the per-file noise.
+          if rsync "${RSYNC_OPTS[@]}" "$SOURCE/" "$BACKUP_DIR/"; then
               log_message "rsync completed to $BACKUP_DIR"
           else
               log_message "ERROR: rsync failed"
@@ -145,6 +167,16 @@
           LAST_SIZE="$(du -sb "$BACKUP_DIR" | cut -f1)"
           LAST_FILES="$DST_FILES"
           log_message "Verified snapshot: $DST_FILES files, $LAST_SIZE bytes"
+
+          # An aborted run leaves an empty photos_* directory behind, and rotation
+          # counts by name, so it claims a slot and evicts a real backup -- which
+          # cost two good snapshots on 2026-09-16. Purge those before rotating.
+          while IFS= read -r candidate; do
+              if [ -z "$(find "$candidate" -type f -print -quit 2>/dev/null)" ]; then
+                  log_message "Removing empty snapshot directory: $candidate"
+                  rm -rf "$candidate"
+              fi
+          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*")
 
           log_message "Starting backup rotation (keeping last $RETAIN)"
 
