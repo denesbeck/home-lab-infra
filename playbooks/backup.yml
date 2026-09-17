@@ -1,5 +1,5 @@
 ---
-- name: Setup daily photo backup with rotation
+- name: Setup photo backup with rotation
   hosts: all
   become: true
 
@@ -10,7 +10,10 @@
     backup_log_path: /var/log/backup-photos.log
     backup_metrics_dir: /var/lib/node-exporter/textfile
     backup_metrics_file: /var/lib/node-exporter/textfile/photos_backup.prom
-    backup_retain: 30
+    backup_lock_path: /run/backup-photos.lock
+    # Snapshots every 6h, so 120 keeps the same 30 days of history as the old
+    # daily run. Hardlinked snapshots cost ~756K each, so depth is nearly free.
+    backup_retain: 120
     backup_user: "{{ ansible_user }}"
     backup_group: "{{ ansible_user }}"
 
@@ -45,6 +48,7 @@
           SOURCE="{{ backup_source }}"
           BACKUP_BASE="{{ backup_destination }}"
           METRICS_FILE="{{ backup_metrics_file }}"
+          LOCK_FILE="{{ backup_lock_path }}"
           RETAIN={{ backup_retain }}
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           BACKUP_DIR="${BACKUP_BASE}/photos_${TIMESTAMP}"
@@ -97,6 +101,18 @@
           }
 
           trap 'on_error $LINENO' ERR
+
+          # Runs must not overlap. A snapshot is sub-second while nothing has
+          # changed, but the run after a bulk import copies for real -- the
+          # 2026-09-16 full copy took 1h51m -- and a second rsync against the
+          # same source would race the first over LINK_DEST and rotation.
+          # Non-blocking: a skipped slot is not a failure, so it leaves the
+          # metrics alone and waits for the next one rather than queueing.
+          exec 9>"$LOCK_FILE"
+          if ! flock -n 9; then
+              log_message "another run holds $LOCK_FILE - skipping this slot"
+              exit 0
+          fi
 
           # `-d` is not a mount check: both paths exist as empty directories on the
           # root filesystem when their USB enclosure is absent.
@@ -207,11 +223,19 @@
         group: "root"
         mode: "0644"
 
-    - name: Setup daily backup cronjob at 1 AM
+    # The cron `name` is the marker Ansible matches on, so the old daily entry
+    # has to be retired by name or it would linger alongside the new schedule.
+    - name: Remove superseded daily backup cronjob
       cron:
         name: "Daily photo backup"
-        minute: "0"
-        hour: "1"
+        state: absent
+
+    # :15 clears both the 03:00 reboot below and the Vaultwarden backup at :30.
+    - name: Setup photo backup cronjob every 6 hours
+      cron:
+        name: "Photo backup"
+        minute: "15"
+        hour: "0,6,12,18"
         job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
         state: present
 
@@ -235,7 +259,7 @@
           - "Backup script created at: {{ backup_script_path }}"
           - "Source directory: {{ backup_source }}"
           - "Backup destination: {{ backup_destination }}"
-          - "Cronjob scheduled: Daily at 1:00 AM"
+          - "Cronjob scheduled: every 6h at :15 (00, 06, 12, 18)"
           - "Log file: {{ backup_log_path }}"
           - "Metrics file: {{ backup_metrics_file }}"
           - "Backup retention: Last {{ backup_retain }} backups"
