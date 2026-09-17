@@ -71,6 +71,7 @@
           FAIL_FILE="$STATE_DIR/consecutive_failures"
           LAST_REBOOT_FILE="$STATE_DIR/last_reboot"
           PIHOLE_STATE_FILE="$STATE_DIR/pihole_state"   # OK | FAIL
+          LINK_STATE_FILE="$STATE_DIR/link_state"       # UP | DOWN
           HOST="$(hostname)"
 
           mkdir -p "$STATE_DIR"
@@ -108,11 +109,40 @@
               return 1
           }
 
+          # Is the LAN address the probe targets actually up? The probe reaches
+          # pihole by DNAT off the host's own LAN IP, so it only means anything
+          # while that IP is assigned and its link has carrier. A wifi carrier
+          # drop takes the address with it and every query fails — a network
+          # outage (known, accepted), not the boot-race detach this check exists
+          # to catch. Interface is derived from the IP so this survives a move
+          # to ethernet.
+          probe_link_up() {
+              local dev
+              dev="$(ip -o -4 addr show | awk -v pfx="$PIHOLE_PROBE_IP/" 'index($4, pfx) == 1 { print $2; exit }')"
+              [ -n "$dev" ] || return 1
+              # carrier is unreadable (EINVAL), not 0, while the iface is down.
+              [ "$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo 0)" = "1" ]
+          }
+
           # ALERT-ONLY pihole check. Runs when the daemon is healthy. Fires a
           # Discord alert on OK->FAIL (with diagnostics) and a recovery note on
           # FAIL->OK. Never recreates pihole — recovery is manual by design.
           check_and_alert_pihole() {
               docker inspect pihole >/dev/null 2>&1 || return 0   # pihole not defined here -> skip
+
+              # Hold the probe while the LAN link is down: it can only fail then,
+              # and the Discord notify would fail with it — which is how an outage
+              # used to surface as an unexplained "recovered" note once it ended.
+              # State is left untouched, so the next run with carrier judges pihole
+              # on its own merits.
+              local prev_link cur_link
+              prev_link="$(cat "$LINK_STATE_FILE" 2>/dev/null || echo UP)"
+              if probe_link_up; then cur_link=UP; else cur_link=DOWN; fi
+              if [ "$cur_link" != "$prev_link" ]; then
+                  log "LAN link $cur_link ($PIHOLE_PROBE_IP) - pihole probe $([ "$cur_link" = UP ] && echo resumed || echo held)"
+              fi
+              echo "$cur_link" >"$LINK_STATE_FILE"
+              [ "$cur_link" = UP ] || return 0
 
               local prev cur
               prev="$(cat "$PIHOLE_STATE_FILE" 2>/dev/null || echo OK)"
