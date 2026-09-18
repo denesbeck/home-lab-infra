@@ -1,21 +1,36 @@
 ---
-- name: Setup photo backup with rotation
+- name: Setup snapshot backups with rotation
   hosts: all
   become: true
 
   vars:
-    backup_source: /mnt/photos
     backup_destination: /mnt/backups
-    backup_script_path: /usr/local/bin/backup-photos.sh
-    backup_log_path: /var/log/backup-photos.log
     backup_metrics_dir: /var/lib/node-exporter/textfile
-    backup_metrics_file: /var/lib/node-exporter/textfile/photos_backup.prom
-    backup_lock_path: /run/backup-photos.lock
-    # Snapshots every 6h, so 120 keeps the same 30 days of history as the old
-    # daily run. Hardlinked snapshots cost ~756K each, so depth is nearly free.
-    backup_retain: 120
     backup_user: "{{ ansible_user }}"
     backup_group: "{{ ansible_user }}"
+    # One entry per source. Everything else -- script, log, lock, metrics file,
+    # snapshot prefix, metric prefix -- is derived from `name`, so the photos
+    # job keeps the exact paths and metric names the alert rules already read.
+    # Sources live on the Seagate, the destination on the WD: a snapshot is
+    # only worth having while the two are different physical disks.
+    backup_jobs:
+      # Snapshots every 6h, so 120 keeps the same 30 days of history as the old
+      # daily run. Hardlinked snapshots cost ~756K each, so depth is nearly free.
+      - name: photos
+        source: /mnt/photos
+        retain: 120
+        # :15 clears both the 03:00 reboot and the Vaultwarden backup at :30.
+        minute: "15"
+        hour: "0,6,12,18"
+        cron_name: "Photo backup"
+      # 258M across 433 files, so the copy is quick and the retention is free.
+      # :45 keeps it clear of photos at :15 and Vaultwarden at :30.
+      - name: private
+        source: /mnt/private
+        retain: 120
+        minute: "45"
+        hour: "0,6,12,18"
+        cron_name: "Private backup"
 
   tasks:
     - name: Ensure backup destination directory exists
@@ -34,9 +49,9 @@
         group: root
         mode: "0755"
 
-    - name: Create backup script
+    - name: Create backup scripts
       copy:
-        dest: "{{ backup_script_path }}"
+        dest: "/usr/local/bin/backup-{{ item.name }}.sh"
         mode: "0755"
         owner: root
         group: root
@@ -45,13 +60,14 @@
           # -E so the ERR trap is inherited by functions and subshells.
           set -Eeuo pipefail
 
-          SOURCE="{{ backup_source }}"
+          SOURCE="{{ item.source }}"
           BACKUP_BASE="{{ backup_destination }}"
-          METRICS_FILE="{{ backup_metrics_file }}"
-          LOCK_FILE="{{ backup_lock_path }}"
-          RETAIN={{ backup_retain }}
+          METRICS_FILE="{{ backup_metrics_dir }}/{{ item.name }}_backup.prom"
+          LOCK_FILE="/run/backup-{{ item.name }}.lock"
+          RETAIN={{ item.retain }}
+          PREFIX="{{ item.name }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          BACKUP_DIR="${BACKUP_BASE}/photos_${TIMESTAMP}"
+          BACKUP_DIR="${BACKUP_BASE}/${PREFIX}_${TIMESTAMP}"
 
           # stdout only -- cron redirects to the log; tee'ing as well wrote every line twice.
           log_message() {
@@ -64,28 +80,28 @@
           }
 
           # Carried forward so a failed run keeps the timestamp the staleness alert reads.
-          LAST_SUCCESS="$(read_metric photos_backup_last_success_timestamp_seconds)"
-          LAST_SIZE="$(read_metric photos_backup_size_bytes)"
-          LAST_FILES="$(read_metric photos_backup_file_count)"
+          LAST_SUCCESS="$(read_metric {{ item.name }}_backup_last_success_timestamp_seconds)"
+          LAST_SIZE="$(read_metric {{ item.name }}_backup_size_bytes)"
+          LAST_FILES="$(read_metric {{ item.name }}_backup_file_count)"
 
           write_metrics() {
               local success="$1"
               printf '%s\n' \
-                  "# HELP photos_backup_success Whether the most recent backup run succeeded (1 = yes, 0 = no)." \
-                  "# TYPE photos_backup_success gauge" \
-                  "photos_backup_success ${success}" \
-                  "# HELP photos_backup_last_run_timestamp_seconds Unix time of the most recent backup attempt." \
-                  "# TYPE photos_backup_last_run_timestamp_seconds gauge" \
-                  "photos_backup_last_run_timestamp_seconds $(date +%s)" \
-                  "# HELP photos_backup_last_success_timestamp_seconds Unix time of the last snapshot that completed and passed verification." \
-                  "# TYPE photos_backup_last_success_timestamp_seconds gauge" \
-                  "photos_backup_last_success_timestamp_seconds ${LAST_SUCCESS}" \
-                  "# HELP photos_backup_size_bytes Size of the last verified snapshot." \
-                  "# TYPE photos_backup_size_bytes gauge" \
-                  "photos_backup_size_bytes ${LAST_SIZE}" \
-                  "# HELP photos_backup_file_count Regular files in the last verified snapshot." \
-                  "# TYPE photos_backup_file_count gauge" \
-                  "photos_backup_file_count ${LAST_FILES}" \
+                  "# HELP {{ item.name }}_backup_success Whether the most recent backup run succeeded (1 = yes, 0 = no)." \
+                  "# TYPE {{ item.name }}_backup_success gauge" \
+                  "{{ item.name }}_backup_success ${success}" \
+                  "# HELP {{ item.name }}_backup_last_run_timestamp_seconds Unix time of the most recent backup attempt." \
+                  "# TYPE {{ item.name }}_backup_last_run_timestamp_seconds gauge" \
+                  "{{ item.name }}_backup_last_run_timestamp_seconds $(date +%s)" \
+                  "# HELP {{ item.name }}_backup_last_success_timestamp_seconds Unix time of the last snapshot that completed and passed verification." \
+                  "# TYPE {{ item.name }}_backup_last_success_timestamp_seconds gauge" \
+                  "{{ item.name }}_backup_last_success_timestamp_seconds ${LAST_SUCCESS}" \
+                  "# HELP {{ item.name }}_backup_size_bytes Size of the last verified snapshot." \
+                  "# TYPE {{ item.name }}_backup_size_bytes gauge" \
+                  "{{ item.name }}_backup_size_bytes ${LAST_SIZE}" \
+                  "# HELP {{ item.name }}_backup_file_count Regular files in the last verified snapshot." \
+                  "# TYPE {{ item.name }}_backup_file_count gauge" \
+                  "{{ item.name }}_backup_file_count ${LAST_FILES}" \
                   > "${METRICS_FILE}.tmp"
               chmod 0644 "${METRICS_FILE}.tmp"
               mv "${METRICS_FILE}.tmp" "$METRICS_FILE"
@@ -130,7 +146,7 @@
 
           SRC_FILES=$(find "$SOURCE" -type f | wc -l)
           if [ "$SRC_FILES" -eq 0 ]; then
-              log_message "ERROR: $SOURCE is mounted but contains no files - aborting rather than snapshotting an empty library"
+              log_message "ERROR: $SOURCE is mounted but contains no files - aborting rather than snapshotting an empty source"
               write_metrics 0
               exit 1
           fi
@@ -145,7 +161,7 @@
                   LINK_DEST="$candidate"
                   break
               fi
-          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" | sort -r)
+          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "${PREFIX}_*" | sort -r)
 
           RSYNC_OPTS=(-aAXHS --stats)
           if [ -n "$LINK_DEST" ]; then
@@ -184,7 +200,7 @@
           LAST_FILES="$DST_FILES"
           log_message "Verified snapshot: $DST_FILES files, $LAST_SIZE bytes"
 
-          # An aborted run leaves an empty photos_* directory behind, and rotation
+          # An aborted run leaves an empty ${PREFIX}_* directory behind, and rotation
           # counts by name, so it claims a slot and evicts a real backup -- which
           # cost two good snapshots on 2026-09-16. Purge those before rotating.
           while IFS= read -r candidate; do
@@ -192,12 +208,12 @@
                   log_message "Removing empty snapshot directory: $candidate"
                   rm -rf "$candidate"
               fi
-          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*")
+          done < <(find "$BACKUP_BASE" -maxdepth 1 -type d -name "${PREFIX}_*")
 
           log_message "Starting backup rotation (keeping last $RETAIN)"
 
-          # Fixed-width photos_YYYYMMDDHHMMSS names, so reverse sort is newest-first.
-          find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" | \
+          # Fixed-width ${PREFIX}_YYYYMMDDHHMMSS names, so reverse sort is newest-first.
+          find "$BACKUP_BASE" -maxdepth 1 -type d -name "${PREFIX}_*" | \
               sort -r | \
               tail -n "+$((RETAIN + 1))" | \
               while IFS= read -r old_backup; do
@@ -210,18 +226,24 @@
           log_message "Backup rotation completed"
 
           log_message "Current backups:"
-          find "$BACKUP_BASE" -maxdepth 1 -type d -name "photos_*" -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r
+          find "$BACKUP_BASE" -maxdepth 1 -type d -name "${PREFIX}_*" -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r
 
           write_metrics 1
           log_message "Backup process finished successfully"
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Create log file with proper permissions
+    - name: Create log files with proper permissions
       file:
-        path: "{{ backup_log_path }}"
+        path: "/var/log/backup-{{ item.name }}.log"
         state: touch
         owner: "root"
         group: "root"
         mode: "0644"
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     # The cron `name` is the marker Ansible matches on, so the old daily entry
     # has to be retired by name or it would linger alongside the new schedule.
@@ -230,14 +252,16 @@
         name: "Daily photo backup"
         state: absent
 
-    # :15 clears both the 03:00 reboot below and the Vaultwarden backup at :30.
-    - name: Setup photo backup cronjob every 6 hours
+    - name: Setup backup cronjobs every 6 hours
       cron:
-        name: "Photo backup"
-        minute: "15"
-        hour: "0,6,12,18"
-        job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
+        name: "{{ item.cron_name }}"
+        minute: "{{ item.minute }}"
+        hour: "{{ item.hour }}"
+        job: "/usr/local/bin/backup-{{ item.name }}.sh >> /var/log/backup-{{ item.name }}.log 2>&1"
         state: present
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Setup daily restart cronjob at 3 AM
       cron:
@@ -247,19 +271,23 @@
         job: "shutdown -r now"
         state: present
 
-    - name: Verify backup script is executable
+    - name: Verify backup scripts are executable
       file:
-        path: "{{ backup_script_path }}"
+        path: "/usr/local/bin/backup-{{ item.name }}.sh"
         mode: "0755"
         state: file
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Display backup configuration
       debug:
-        msg:
-          - "Backup script created at: {{ backup_script_path }}"
-          - "Source directory: {{ backup_source }}"
-          - "Backup destination: {{ backup_destination }}"
-          - "Cronjob scheduled: every 6h at :15 (00, 06, 12, 18)"
-          - "Log file: {{ backup_log_path }}"
-          - "Metrics file: {{ backup_metrics_file }}"
-          - "Backup retention: Last {{ backup_retain }} backups"
+        msg: >-
+          {{ item.name }}: {{ item.source }} -> {{ backup_destination }}/{{ item.name }}_*
+          | cron {{ item.minute }} {{ item.hour }}
+          | keep {{ item.retain }}
+          | log /var/log/backup-{{ item.name }}.log
+          | metrics {{ backup_metrics_dir }}/{{ item.name }}_backup.prom
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"

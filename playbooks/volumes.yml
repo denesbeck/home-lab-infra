@@ -79,12 +79,62 @@
           #!/bin/bash
           set -uo pipefail
 
+          # Space separated rather than an array: the mount points are a fixed
+          # list from the playbook and contain no spaces, and bash's array-length
+          # syntax opens with the two characters Jinja reads as a comment, which
+          # breaks templating of this file.
+          remounted=""
+
           for target in {{ managed_mounts | join(' ') }}; do
               findmnt --noheadings --mountpoint "$target" >/dev/null 2>&1 && continue
               if mount "$target" >/dev/null 2>&1; then
                   logger -t mount-retry "mounted $target"
+                  remounted="$remounted $target"
               fi
           done
+
+          [ -n "$remounted" ] || exit 0
+
+          # A Docker bind mount is resolved once, at container start, and is
+          # rprivate -- nothing that happens to the host mount afterwards reaches
+          # it. So a container that started while the enclosure was absent holds
+          # the empty directory on the root LV, and one that was running through a
+          # USB drop holds the detached filesystem. Both show an empty folder for
+          # as long as the container lives, silently: the mount is healthy on the
+          # host, so no filesystem alert has anything to fire on. Both cost
+          # filebrowser its photos and private folders on 2026-09-18. A restart is
+          # the only thing that re-resolves the bind.
+          command -v docker >/dev/null 2>&1 || exit 0
+          docker info >/dev/null 2>&1 || exit 0
+
+          affected=""
+          for container in $(docker ps --format '{% raw %}{{.Names}}{% endraw %}' 2>/dev/null); do
+              binds="$(docker inspect -f '{% raw %}{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}{% endraw %}' "$container" 2>/dev/null)" || continue
+              match=""
+              # A bind *under* a remounted path is just as stale as one on it --
+              # qbittorrent binds /mnt/movies/__DOWNLOADS__, not /mnt/movies.
+              while IFS= read -r source; do
+                  [ -n "$source" ] || continue
+                  for target in $remounted; do
+                      case "$source" in
+                          "$target"|"$target"/*) match=1; break 2 ;;
+                      esac
+                  done
+              done <<<"$binds"
+              [ -n "$match" ] || continue
+              case " $affected " in
+                  *" $container "*) ;;
+                  *) affected="$affected $container" ;;
+              esac
+          done
+
+          for container in $affected; do
+              logger -t mount-retry "restarting $container to rebind remounted paths"
+              docker restart "$container" >/dev/null 2>&1 \
+                  || logger -t mount-retry "ERROR: failed to restart $container"
+          done
+
+          exit 0
 
     - name: Create mount retry systemd service
       copy:
