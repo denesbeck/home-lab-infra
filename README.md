@@ -111,6 +111,7 @@ graph TD
 │   ├── main.yml             # Master orchestrator
 │   ├── backup.yml           # Photo backup with rotation + daily restart cron
 │   ├── backup-vaultwarden.yml # Vaultwarden S3 backup setup (AWS CLI, script, cron)
+│   ├── backup-offsite.yml   # Off-site S3 copy of photos (Deep Archive) + private (age-encrypted)
 │   ├── cloudwatch-agent.yml  # CloudWatch heartbeat agent for DR failover detection
 │   ├── docker.yml           # Docker CE installation
 │   ├── filebrowser.yml      # Filebrowser container
@@ -136,8 +137,8 @@ graph TD
 │   ├── provider.tf          # AWS provider (SSO profile)
 │   ├── variables.tf         # Input variables
 │   ├── outputs.tf           # Bucket names, access keys
-│   ├── s3.tf                # Terraform state bucket + Vaultwarden backup bucket
-│   ├── iam.tf               # IAM user, policy, access key for backups
+│   ├── s3.tf                # Terraform state, Vaultwarden backup and off-site backup buckets
+│   ├── iam.tf               # Upload-only IAM users + access keys for the backups
 │   └── vaultwarden-dr/      # DR failover infrastructure
 │       ├── cloudwatch.tf    # Heartbeat alarm (failover + recovery)
 │       ├── ec2.tf           # Launch template (spot) + security group
@@ -165,6 +166,7 @@ graph TD
     ├── qbittorrent.yml
     ├── cloudwatch.yml
     ├── vaultwarden.yml
+    ├── offsite-backup.yml
     └── ups-monitor.yml
 ```
 
@@ -197,10 +199,11 @@ ansible-playbook playbooks/tailscale.yml
 ansible-playbook playbooks/vaultwarden.yml
 ansible-playbook playbooks/ups-monitor.yml
 ansible-playbook playbooks/backup-vaultwarden.yml
+ansible-playbook playbooks/backup-offsite.yml
 ansible-playbook playbooks/cloudwatch-agent.yml
 ```
 
-> **Note:** Pi-hole, Jellyfin, Tailscale, Vaultwarden, UPS Monitor, Vaultwarden backup, and CloudWatch agent are not included in `main.yml` and must be run separately.
+> **Note:** Pi-hole, Jellyfin, Tailscale, Vaultwarden, UPS Monitor, Vaultwarden backup, off-site backup, and CloudWatch agent are not included in `main.yml` and must be run separately.
 
 ### Utility tasks
 
@@ -229,6 +232,7 @@ All variable files live in `vars/` and are gitignored to protect secrets. You ne
 | `vars/filebrowser.yml` | Paths |
 | `vars/portainer.yml` | Data path |
 | `vars/vaultwarden.yml` | Data path, port, AWS credentials, S3 bucket/region |
+| `vars/offsite-backup.yml` | Off-site S3 bucket/region, upload-only AWS credentials, age public key |
 | `vars/cloudwatch.yml` | Namespace, metric name, heartbeat interval |
 | `vars/ups-monitor.yml` | Router IP for ping monitoring |
 
@@ -257,6 +261,45 @@ Four ext4 partitions are mounted via fstab (by UUID):
 **Photo backup:** A daily cron job (1:00 AM) runs `rsync` to back up `/mnt/photos` to `/mnt/backups` with timestamp-based rotation, keeping the last 3 backups. The server is also configured to restart daily at 3:00 AM.
 
 **Vaultwarden backup:** An hourly cron job creates a consistent SQLite backup using `sqlite3 .backup` on the host, archives the full data directory, and uploads it to S3. Old backups are automatically expired by a 3-day S3 lifecycle rule (~72 restore points). AWS infrastructure (S3 bucket, IAM user, policy) is managed via Terraform in `terraform/`.
+
+**Off-site backup:** A daily cron job copies the *live* `/mnt/photos` and `/mnt/private` to S3, not the snapshots in `/mnt/backups`, which share one disk. Photos go file by file with `aws s3 sync` into Glacier Deep Archive (10:05 UTC, about $0.35/month for 165 GB). Private is tarred, encrypted with [age](https://age-encryption.org) to a public key, and uploaded as a single Standard-IA object, but only when the tree has changed (10:50 UTC). The server holds no private key, so it can write that archive but never read it. The IAM key can list and upload but **not delete**, and the bucket is versioned, so overwritten objects stay recoverable for 180 days. The flip side is that files deleted locally are kept off-site. Each run writes `offsite_{photos,private}_backup_*` metrics for the alerts in `home-lab-monitoring`.
+
+Setup:
+
+```bash
+# 1. On your own machine, never on the server. Keep offsite-backup.key somewhere
+#    that survives the server dying (it is the ONLY way to read the private archive).
+age-keygen -o offsite-backup.key            # prints "Public key: age1..."
+
+# 2. Bucket, upload-only user and a monthly AWS budget alert
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # set budget_alert_email
+terraform apply
+terraform output offsite_backup_access_key_id
+terraform output -raw offsite_backup_secret_access_key
+
+# 3. Put the keys and the age1... public key in vars/offsite-backup.yml, then
+ansible-playbook playbooks/backup-offsite.yml --ask-become-pass
+```
+
+Restore (with the `admin` profile; the backup key cannot read or restore):
+
+```bash
+B=home-lab-offsite-backup-<suffix>
+
+# Private: one object, readable immediately
+aws s3 cp s3://$B/private/private.tar.age - | age -d -i offsite-backup.key | tar -C /mnt/private -xf -
+# Older versions: aws s3api list-object-versions --bucket $B --prefix private/
+
+# Photos: Deep Archive objects must be restored before download (Bulk: <=48h, ~$0.0025/GB)
+aws s3api list-objects-v2 --bucket $B --prefix photos/ --query 'Contents[].Key' --output text \
+  | tr '\t' '\n' | while read -r k; do
+      aws s3api restore-object --bucket $B --key "$k" \
+        --restore-request '{"Days":7,"GlacierJobParameters":{"Tier":"Bulk"}}'
+    done
+# ...once restored:
+aws s3 sync s3://$B/photos/ /mnt/photos/ --force-glacier-transfer
+```
 
 **Vaultwarden DR failover:** A CloudWatch heartbeat agent sends a custom metric every 60 seconds. If heartbeats stop for ~3 minutes, a CloudWatch alarm triggers a Lambda function that launches an EC2 spot instance, restores the latest S3 backup, connects to Tailscale, obtains a Let's Encrypt certificate via Cloudflare DNS-01 challenge, updates the DNS record to the Tailscale IP, and serves Vaultwarden behind nginx with TLS at `https://vaultwarden-dr.arcade-lab.io`. When heartbeats resume for 3 consecutive minutes, the failover instance is automatically terminated. Infrastructure is managed via Terraform in `terraform/vaultwarden-dr/`.
 

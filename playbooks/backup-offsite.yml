@@ -1,0 +1,347 @@
+---
+# Off-site S3 copy of the live sources (not /mnt/backups, which shares the WD).
+# Restore: see "Off-site backup" in README.md.
+- name: Setup off-site S3 backup of photos and private
+  hosts: all
+  become: true
+  vars_files:
+    - ../vars/offsite-backup.yml
+
+  vars:
+    backup_metrics_dir: /var/lib/node-exporter/textfile
+    offsite_state_dir: /var/lib/offsite-backup
+    # backup-vaultwarden.yml overwrites /root/.aws/credentials, so keep our own.
+    offsite_aws_dir: /root/.aws/offsite-backup
+    # "" = unlimited
+    offsite_backup_max_bandwidth: "5MB/s"
+    offsite_jobs:
+      # Mid-morning: the box is off most nights. Clear of the :15/:30/:45 jobs.
+      - name: photos
+        kind: sync
+        source: /mnt/photos
+        storage_class: DEEP_ARCHIVE
+        minute: "5"
+        hour: "10"
+      - name: private
+        kind: archive
+        source: /mnt/private
+        storage_class: STANDARD_IA
+        minute: "50"
+        hour: "10"
+
+  tasks:
+    - name: Require the age recipient (public key) to be set
+      assert:
+        that:
+          - offsite_backup_age_recipient is match('^age1[a-z0-9]{58}$')
+        fail_msg: >-
+          offsite_backup_age_recipient in vars/offsite-backup.yml must be an age
+          public key (age1...). Generate the pair OFF this server with
+          `age-keygen -o offsite-backup.key` and keep the key file somewhere
+          that does not depend on this server.
+
+    - name: Check AWS CLI v2 is installed
+      command: aws --version
+      register: aws_cli_check
+      changed_when: false
+      failed_when: "aws_cli_check.rc != 0 or 'aws-cli/2' not in (aws_cli_check.stdout + aws_cli_check.stderr)"
+
+    - name: Install age
+      apt:
+        name: age
+        state: present
+        update_cache: yes
+
+    - name: Create directories
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ offsite_aws_dir }}", mode: "0700" }
+        - { path: "{{ offsite_state_dir }}", mode: "0700" }
+        - { path: "{{ backup_metrics_dir }}", mode: "0755" }
+
+    - name: Deploy AWS credentials
+      copy:
+        dest: "{{ offsite_aws_dir }}/credentials"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [default]
+          aws_access_key_id = {{ offsite_backup_aws_access_key_id }}
+          aws_secret_access_key = {{ offsite_backup_aws_secret_access_key }}
+
+    - name: Deploy AWS config
+      copy:
+        dest: "{{ offsite_aws_dir }}/config"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [default]
+          region = {{ offsite_backup_s3_region }}
+          s3 =
+            max_concurrent_requests = 4
+          {% if offsite_backup_max_bandwidth %}
+            max_bandwidth = {{ offsite_backup_max_bandwidth }}
+          {% endif %}
+
+    - name: Create backup scripts
+      copy:
+        dest: "/usr/local/bin/backup-offsite-{{ item.name }}.sh"
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/bash
+          set -Eeuo pipefail
+
+          SOURCE="{{ item.source }}"
+          DEST="s3://{{ offsite_backup_s3_bucket }}/{{ item.name }}"
+          STORAGE_CLASS="{{ item.storage_class }}"
+          METRICS_FILE="{{ backup_metrics_dir }}/offsite_{{ item.name }}_backup.prom"
+          LOCK_FILE="/run/backup-offsite-{{ item.name }}.lock"
+          M="offsite_{{ item.name }}_backup"
+
+          export AWS_SHARED_CREDENTIALS_FILE="{{ offsite_aws_dir }}/credentials"
+          export AWS_CONFIG_FILE="{{ offsite_aws_dir }}/config"
+
+          TMP_DIR="$(mktemp -d /var/tmp/backup-offsite-{{ item.name }}.XXXXXX)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          log_message() {
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+          }
+
+          read_metric() {
+              local default="${2:-0}"
+              [ -r "$METRICS_FILE" ] || { echo "$default"; return 0; }
+              awk -v k="$1" -v d="$default" '$1 == k { v = $2 } END { print (v == "" ? d : v) }' "$METRICS_FILE"
+          }
+
+          # Carried forward so a failed run keeps the last-success timestamp.
+          SUCCESS="$(read_metric ${M}_success 1)"
+          LAST_SUCCESS="$(read_metric ${M}_last_success_timestamp_seconds)"
+          FIRST_ATTEMPT="$(read_metric ${M}_first_attempt_timestamp_seconds)"
+          LAST_SIZE="$(read_metric ${M}_size_bytes)"
+          LAST_FILES="$(read_metric ${M}_file_count)"
+          LAST_UPLOADED="$(read_metric ${M}_uploaded_files)"
+          [ "$FIRST_ATTEMPT" != "0" ] || FIRST_ATTEMPT="$(date +%s)"
+
+          write_metrics() {
+              SUCCESS="$1"
+              printf '%s\n' \
+                  "# HELP ${M}_success Whether the most recent off-site run succeeded (1 = yes, 0 = no)." \
+                  "# TYPE ${M}_success gauge" \
+                  "${M}_success ${SUCCESS}" \
+                  "# HELP ${M}_last_run_timestamp_seconds Unix time of the most recent off-site run start or finish." \
+                  "# TYPE ${M}_last_run_timestamp_seconds gauge" \
+                  "${M}_last_run_timestamp_seconds $(date +%s)" \
+                  "# HELP ${M}_last_success_timestamp_seconds Unix time the off-site copy was last verified to match the source. 0 = never." \
+                  "# TYPE ${M}_last_success_timestamp_seconds gauge" \
+                  "${M}_last_success_timestamp_seconds ${LAST_SUCCESS}" \
+                  "# HELP ${M}_first_attempt_timestamp_seconds Unix time of the first off-site run, for alerting on a first upload that never finishes." \
+                  "# TYPE ${M}_first_attempt_timestamp_seconds gauge" \
+                  "${M}_first_attempt_timestamp_seconds ${FIRST_ATTEMPT}" \
+                  "# HELP ${M}_size_bytes Bytes covered by the last verified off-site copy." \
+                  "# TYPE ${M}_size_bytes gauge" \
+                  "${M}_size_bytes ${LAST_SIZE}" \
+                  "# HELP ${M}_file_count Source files covered by the last verified off-site copy." \
+                  "# TYPE ${M}_file_count gauge" \
+                  "${M}_file_count ${LAST_FILES}" \
+                  "# HELP ${M}_uploaded_files Files uploaded by the last verified run (0 = nothing had changed)." \
+                  "# TYPE ${M}_uploaded_files gauge" \
+                  "${M}_uploaded_files ${LAST_UPLOADED}" \
+                  > "${METRICS_FILE}.tmp"
+              chmod 0644 "${METRICS_FILE}.tmp"
+              mv "${METRICS_FILE}.tmp" "$METRICS_FILE"
+          }
+
+          fail() {
+              log_message "ERROR: $1"
+              write_metrics 0
+              exit 1
+          }
+
+          on_error() {
+              local rc=$?
+              local line="$1"
+              set +e
+              log_message "ERROR: off-site backup failed with exit $rc at line $line"
+              write_metrics 0
+              exit "$rc"
+          }
+
+          trap 'on_error $LINENO' ERR
+
+          exec 9>"$LOCK_FILE"
+          if ! flock -n 9; then
+              log_message "another run holds $LOCK_FILE - skipping this slot"
+              exit 0
+          fi
+
+          # An unplugged drive leaves an empty directory, so check the mount.
+          findmnt --noheadings --mountpoint "$SOURCE" >/dev/null 2>&1 \
+              || fail "$SOURCE is not a mounted filesystem - aborting"
+
+          # Written early so last_run moves during a long first upload.
+          write_metrics "$SUCCESS"
+
+          log_message "Starting off-site backup of $SOURCE to $DEST ($STORAGE_CLASS)"
+          {% if item.kind == 'sync' %}
+
+          # Must match the find filters in count_source_files.
+          SYNC_EXCLUDES=(
+              --exclude 'lost+found/*'
+              --exclude '.DS_Store'  --exclude '*/.DS_Store'
+              --exclude '._*'        --exclude '*/._*'
+              --exclude 'Thumbs.db'  --exclude '*/Thumbs.db'
+              --exclude 'desktop.ini' --exclude '*/desktop.ini'
+          )
+          count_source_files() {
+              find "$SOURCE" -path "$SOURCE/lost+found" -prune -o -type f \
+                  ! -name '.DS_Store' ! -name '._*' ! -name 'Thumbs.db' ! -name 'desktop.ini' \
+                  -print | wc -l
+          }
+
+          SRC_FILES="$(count_source_files)"
+          [ "$SRC_FILES" -gt 0 ] \
+              || fail "$SOURCE is mounted but contains no files - aborting"
+
+          # No --delete: the copy is additive and the key cannot delete.
+          aws s3 sync "$SOURCE/" "$DEST/" \
+              --storage-class "$STORAGE_CLASS" \
+              --no-progress \
+              "${SYNC_EXCLUDES[@]}" \
+              | tee "$TMP_DIR/sync.log"
+
+          UPLOADED="$(grep -c '^upload:' "$TMP_DIR/sync.log" || true)"
+
+          # >=: files deleted locally stay off-site.
+          REMOTE_FILES="$(aws s3 ls "$DEST/" --recursive | wc -l)"
+          [ "$REMOTE_FILES" -ge "$SRC_FILES" ] \
+              || fail "off-site has $REMOTE_FILES objects for $SRC_FILES source files - not marking this run verified"
+
+          LAST_SIZE="$(du -sb --exclude=lost+found "$SOURCE" | cut -f1)"
+          LAST_FILES="$SRC_FILES"
+          LAST_UPLOADED="$UPLOADED"
+          LAST_SUCCESS="$(date +%s)"
+          log_message "Verified: $SRC_FILES source files, $REMOTE_FILES objects off-site, $UPLOADED uploaded this run"
+          {% else %}
+
+          ARCHIVE_KEY="$DEST/{{ item.name }}.tar.age"
+          FINGERPRINT_FILE="{{ offsite_state_dir }}/{{ item.name }}.fingerprint"
+
+          SRC_FILES="$(find "$SOURCE" -path "$SOURCE/lost+found" -prune -o -type f -print | wc -l)"
+          [ "$SRC_FILES" -gt 0 ] \
+              || fail "$SOURCE is mounted but contains no files - aborting"
+
+          # Skip the upload when the tree is unchanged.
+          FINGERPRINT="$(find "$SOURCE" -path "$SOURCE/lost+found" -prune -o -printf '%P\t%s\t%T@\t%m\n' \
+              | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
+
+          remote_size() {
+              aws s3 ls "$ARCHIVE_KEY" | awk '{ print $3 }' || true
+          }
+
+          PREV_FINGERPRINT=""; PREV_SIZE=""
+          if [ -r "$FINGERPRINT_FILE" ]; then
+              read -r PREV_FINGERPRINT PREV_SIZE < "$FINGERPRINT_FILE" || true
+          fi
+
+          if [ "$FINGERPRINT" = "$PREV_FINGERPRINT" ] && [ "$(remote_size)" = "$PREV_SIZE" ]; then
+              LAST_UPLOADED=0
+              LAST_FILES="$SRC_FILES"
+              LAST_SUCCESS="$(date +%s)"
+              log_message "Unchanged since the last upload and still present off-site ($PREV_SIZE bytes) - nothing to do"
+          else
+              log_message "Archiving $SRC_FILES files and encrypting to {{ offsite_backup_age_recipient }}"
+              tar --exclude=./lost+found -C "$SOURCE" -cf - . \
+                  | age -r "{{ offsite_backup_age_recipient }}" -o "$TMP_DIR/archive.tar.age"
+
+              SIZE="$(stat -c %s "$TMP_DIR/archive.tar.age")"
+              log_message "Uploading $SIZE bytes to $ARCHIVE_KEY"
+              aws s3 cp "$TMP_DIR/archive.tar.age" "$ARCHIVE_KEY" \
+                  --storage-class "$STORAGE_CLASS" --no-progress
+
+              REMOTE_SIZE="$(remote_size)"
+              [ "$REMOTE_SIZE" = "$SIZE" ] \
+                  || fail "off-site object is '$REMOTE_SIZE' bytes, uploaded $SIZE - not marking this run verified"
+
+              printf '%s %s\n' "$FINGERPRINT" "$SIZE" > "$FINGERPRINT_FILE"
+              LAST_SIZE="$SIZE"
+              LAST_FILES="$SRC_FILES"
+              LAST_UPLOADED="$SRC_FILES"
+              LAST_SUCCESS="$(date +%s)"
+              log_message "Verified: $SIZE bytes off-site for $SRC_FILES files"
+          fi
+          {% endif %}
+
+          write_metrics 1
+          log_message "Off-site backup finished successfully"
+      loop: "{{ offsite_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Keeps the alerts from firing before the first run; never overwrites.
+    - name: Seed metrics until the first run writes its own
+      copy:
+        dest: "{{ backup_metrics_dir }}/offsite_{{ item.name }}_backup.prom"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          offsite_{{ item.name }}_backup_success 1
+          offsite_{{ item.name }}_backup_last_run_timestamp_seconds {{ ansible_date_time.epoch }}
+          offsite_{{ item.name }}_backup_last_success_timestamp_seconds 0
+          offsite_{{ item.name }}_backup_first_attempt_timestamp_seconds {{ ansible_date_time.epoch }}
+          offsite_{{ item.name }}_backup_size_bytes 0
+          offsite_{{ item.name }}_backup_file_count 0
+          offsite_{{ item.name }}_backup_uploaded_files 0
+      loop: "{{ offsite_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Create log files
+      file:
+        path: "/var/log/backup-offsite-{{ item.name }}.log"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+      loop: "{{ offsite_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Rotate the logs
+      copy:
+        dest: /etc/logrotate.d/backup-offsite
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          /var/log/backup-offsite-*.log {
+              monthly
+              rotate 6
+              compress
+              missingok
+              notifempty
+          }
+
+    - name: Setup daily cronjobs
+      cron:
+        name: "Off-site {{ item.name }} backup to S3"
+        minute: "{{ item.minute }}"
+        hour: "{{ item.hour }}"
+        job: "/usr/local/bin/backup-offsite-{{ item.name }}.sh >> /var/log/backup-offsite-{{ item.name }}.log 2>&1"
+        state: present
+      loop: "{{ offsite_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"

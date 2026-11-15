@@ -15,6 +15,7 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/*.tfplan
+terraform/terraform.tfvars
 terraform/vaultwarden-dr/.terraform/
 terraform/vaultwarden-dr/*.tfstate
 terraform/vaultwarden-dr/*.tfstate.backup
