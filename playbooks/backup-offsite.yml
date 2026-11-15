@@ -15,13 +15,13 @@
     # "" = unlimited
     offsite_backup_max_bandwidth: "5MB/s"
     offsite_jobs:
-      # Mid-morning: the box is off most nights. Clear of the :15/:30/:45 jobs.
+      # Clear of the :15/:30/:45 jobs. Hourly so uploads resume soon after boot.
       - name: photos
         kind: sync
         source: /mnt/photos
         storage_class: DEEP_ARCHIVE
         minute: "5"
-        hour: "10"
+        hour: "*"
       - name: private
         kind: archive
         source: /mnt/private
