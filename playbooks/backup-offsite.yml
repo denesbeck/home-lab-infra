@@ -12,8 +12,7 @@
     offsite_state_dir: /var/lib/offsite-backup
     # backup-vaultwarden.yml overwrites /root/.aws/credentials, so keep our own.
     offsite_aws_dir: /root/.aws/offsite-backup
-    # "" = unlimited
-    offsite_backup_max_bandwidth: "5MB/s"
+    offsite_backup_max_bandwidth: "1MB/s"
     offsite_jobs:
       # Clear of the :15/:30/:45 jobs. Hourly so uploads resume soon after boot.
       - name: photos
