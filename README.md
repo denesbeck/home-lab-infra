@@ -109,10 +109,11 @@ graph TD
 │   └── hosts.ini            # Single-host inventory
 ├── playbooks/               # Service playbooks
 │   ├── main.yml             # Master orchestrator
-│   ├── backup.yml           # Photo backup with rotation + daily restart cron
+│   ├── backup.yml           # Photo + private snapshots with rotation + daily restart cron
 │   ├── backup-vaultwarden.yml # Vaultwarden S3 backup setup (AWS CLI, script, cron)
 │   ├── backup-offsite.yml   # Off-site S3 copy of photos (Deep Archive) + private (age-encrypted)
 │   ├── cloudwatch-agent.yml  # CloudWatch heartbeat agent for DR failover detection
+│   ├── disk-health.yml      # Disk presence + SMART metrics for Prometheus
 │   ├── docker.yml           # Docker CE installation
 │   ├── filebrowser.yml      # Filebrowser container
 │   ├── jellyfin.yml         # Jellyfin media server container
@@ -167,6 +168,7 @@ graph TD
     ├── cloudwatch.yml
     ├── vaultwarden.yml
     ├── offsite-backup.yml
+    ├── disk-health.yml      # Expected disk serials
     └── ups-monitor.yml
 ```
 
@@ -186,7 +188,7 @@ Run the master playbook to provision everything in the correct order:
 ansible-playbook playbooks/main.yml
 ```
 
-The master playbook executes in this order: system updates, volume mounts, Samba, Docker, NGINX, SSH hardening, UFW firewall, qBittorrent, Filebrowser, backup, monitoring, and Portainer.
+The master playbook executes in this order: system updates, volume mounts, Samba, Docker, NGINX, SSH hardening, UFW firewall, qBittorrent, Filebrowser, backup, monitoring, disk health, and Portainer.
 
 ### Individual services
 
@@ -235,12 +237,14 @@ All variable files live in `vars/` and are gitignored to protect secrets. You ne
 | `vars/offsite-backup.yml` | Off-site S3 bucket/region, upload-only AWS credentials, age public key |
 | `vars/cloudwatch.yml` | Namespace, metric name, heartbeat interval |
 | `vars/ups-monitor.yml` | Router IP for ping monitoring |
+| `vars/disk-health.yml` | Label and serial of every disk that should be attached |
 
 ## Security
 
 - **SSH:** Non-standard port, public key authentication only, root login disabled, restricted user access
 - **Firewall (UFW):** Default deny incoming; allows only SSH, SMB, HTTP/HTTPS, and Tailscale traffic
-- **Containers:** All bound to `127.0.0.1`, accessible only through the NGINX reverse proxy
+- **Containers:** All bound to `127.0.0.1`, accessible only through the NGINX reverse proxy. Images are pinned to versions in `vars/containers.yml`
+- **Portainer:** Reachable only from Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), since it controls the Docker socket
 - **Samba:** SMB3-only, restricted to LAN and Tailscale subnets
 - **Remote access:** Tailscale VPN with tag-based ACLs
 - **Secrets:** Variable files are gitignored rather than vault-encrypted
@@ -254,11 +258,11 @@ Four ext4 partitions are mounted via fstab (by UUID):
 | `/mnt/private` | Private files (Samba + Filebrowser) |
 | `/mnt/photos` | Photo storage (Samba + Filebrowser + backup source) |
 | `/mnt/movies` | Media library (Samba + Filebrowser + Jellyfin + qBittorrent) |
-| `/mnt/backups` | Backup destination (rsync with 3-backup rotation) |
+| `/mnt/backups` | Local snapshot destination (hardlinked rsync snapshots, 120 kept per source) |
 
 ## Backup
 
-**Photo backup:** A daily cron job (1:00 AM) runs `rsync` to back up `/mnt/photos` to `/mnt/backups` with timestamp-based rotation, keeping the last 3 backups. The server is also configured to restart daily at 3:00 AM.
+**Local snapshots:** Every 6 hours (photos at :15, private at :45) `rsync` snapshots `/mnt/photos` and `/mnt/private` into `/mnt/backups`, hardlinking unchanged files against the previous snapshot and keeping the last 120 (30 days). The server is also configured to restart daily at 3:00 AM.
 
 **Vaultwarden backup:** An hourly cron job creates a consistent SQLite backup using `sqlite3 .backup` on the host, archives the full data directory, and uploads it to S3. Old backups are automatically expired by a 3-day S3 lifecycle rule (~72 restore points). AWS infrastructure (S3 bucket, IAM user, policy) is managed via Terraform in `terraform/`.
 
@@ -305,4 +309,4 @@ aws s3 sync s3://$B/photos/ /mnt/photos/ --force-glacier-transfer
 
 ## Monitoring
 
-The Prometheus and Grafana stack is managed via a separate repository ([home-lab-monitoring](https://github.com/denesbeck/home-lab-monitoring)) which is cloned and started with `docker compose`. The UPS monitor script exports power metrics to Prometheus via the node_exporter textfile collector.
+The Prometheus and Grafana stack is managed via a separate repository ([home-lab-monitoring](https://github.com/denesbeck/home-lab-monitoring)) which is cloned and started with `docker compose`. The UPS monitor, backup jobs, disk health exporter (`disk-health.yml`: presence, SMART attributes, self-tests, NVMe health every 10 minutes) and TLS certificate check (`nginx.yml`: expiry of the certificate nginx serves, hourly) export metrics to Prometheus via the node_exporter textfile collector.

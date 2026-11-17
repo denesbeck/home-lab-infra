@@ -76,13 +76,68 @@
         mode: '0644'
       when: dhparam_exists.stat.exists or not dhparam_exists.stat.exists
 
-    - name: Set up certbot auto-renewal with NGINX reload
+    - name: Remove the overnight certbot cron
       cron:
         name: "certbot-renew"
-        minute: "30"
-        hour: "2"
-        weekday: "1"
-        job: "certbot renew --quiet --deploy-hook 'systemctl reload nginx'"
+        user: root
+        state: absent
+
+    - name: Ensure certbot.timer is enabled
+      systemd:
+        name: certbot.timer
+        enabled: yes
+        state: started
+
+    - name: Reload NGINX after every certificate renewal
+      copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          systemctl reload nginx
+
+    - name: Ensure textfile collector directory exists
+      file:
+        path: /var/lib/node-exporter/textfile
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy TLS certificate expiry check
+      copy:
+        dest: /usr/local/bin/tls-cert-check.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          HOST="vaultwarden.{{ certbot_domain }}"
+          OUT=/var/lib/node-exporter/textfile/tls_cert.prom
+
+          END="$(echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$HOST" 2>/dev/null \
+              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)"
+
+          {
+              echo "# HELP tls_cert_not_after_timestamp_seconds Expiry of the certificate nginx serves."
+              echo "# TYPE tls_cert_not_after_timestamp_seconds gauge"
+              [ -n "$END" ] && echo "tls_cert_not_after_timestamp_seconds{host=\"$HOST\"} $(date -d "$END" +%s)"
+              echo "# HELP tls_cert_check_last_run_timestamp_seconds Unix time of the last check."
+              echo "# TYPE tls_cert_check_last_run_timestamp_seconds gauge"
+              echo "tls_cert_check_last_run_timestamp_seconds $(date +%s)"
+          } > "$OUT.tmp"
+          chmod 0644 "$OUT.tmp"
+          mv "$OUT.tmp" "$OUT"
+
+    - name: Check the served certificate hourly
+      cron:
+        name: "TLS certificate expiry check"
+        minute: "20"
+        job: "/usr/local/bin/tls-cert-check.sh 2>&1 | logger -t tls-cert-check"
         user: root
 
     - name: Remove default NGINX site config
@@ -95,8 +150,16 @@
         src: ../config/nginx.conf.j2
         dest: /etc/nginx/sites-enabled/docker.conf
 
+    - name: Validate NGINX config
+      command: nginx -t
+      changed_when: false
+
     - name: Restart NGINX service
       service:
         name: nginx
         state: restarted
         enabled: yes
+
+    - name: Record the served certificate's expiry now
+      command: /usr/local/bin/tls-cert-check.sh
+      changed_when: false

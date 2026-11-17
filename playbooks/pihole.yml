@@ -51,6 +51,7 @@
         image: "{{ pihole_image }}"
         state: started
         restart_policy: unless-stopped
+        shm_size: 256M
         published_ports: >-
           {{
             pihole_dns_hosts
