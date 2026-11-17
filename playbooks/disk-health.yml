@@ -10,7 +10,21 @@
     disk_health_config: /etc/disk-health.json
     disk_health_metrics_dir: /var/lib/node-exporter/textfile
 
+  handlers:
+    - name: Apply udev rules
+      shell: udevadm control --reload && udevadm trigger --subsystem-match=scsi_disk --action=add
+
   tasks:
+    - name: Spin down USB disks before power-off
+      copy:
+        dest: /etc/udev/rules.d/60-usb-disk-shutdown.rules
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          ACTION=="add", SUBSYSTEM=="scsi_disk", ATTR{manage_shutdown}="1"
+      notify: Apply udev rules
+
     - name: Install smartmontools
       apt:
         name: smartmontools
@@ -49,9 +63,13 @@
           OUT = "/var/lib/node-exporter/textfile/disk_health.prom"
 
           ATA_ATTRIBUTES = {
+              4: "start_stop_count",
               5: "reallocated_sector_ct",
+              12: "power_cycle_count",
               187: "reported_uncorrect",
               188: "command_timeout",
+              192: "power_off_retract_count",
+              193: "load_cycle_count",
               197: "current_pending_sector",
               198: "offline_uncorrectable",
               199: "udma_crc_error_count",
